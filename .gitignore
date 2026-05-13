@@ -1,13 +1,27 @@
-backend/__pycache__/
-backend/*.pyc
-backend/*.pyo
-backend/*.db
-backend/logs/
-backend/venv/
-backend/node_modules/
-frontend/node_modules/
-frontend/build/
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Local DB and backups
+backend/smeta.db
+backend/smeta.db-journal
+backend/*.bak
+backend/*.bak.*
+*.bak.*
+
+# Secrets
+backend/settings.json
+backend/.env
 .env
-.env.*
+
+# Docker leftovers
+backend/Dockerfile
+
+# Logs / tmp
 *.log
-Thumbs.db
+*.tmp
+*.swp
+.DS_Store

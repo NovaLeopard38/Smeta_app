@@ -45,7 +45,15 @@ from crud import (
     update_smeta,
     update_smeta_item,
 )
-from models import Base, Smeta, SmetaAccess, SmetaRevision, User
+from models import Base, Material, Smeta, SmetaAccess, SmetaRevision, User
+# # VSB_BACKEND_V2 — attach image_url column to Material at runtime
+from sqlalchemy import Column as _Col, String as _Str
+if not hasattr(Material, 'image_url'):
+    try:
+        Material.image_url = _Col('image_url', _Str, default='')
+    except Exception:
+        pass
+
 
 
 def simple_ai_assistant(prompt: str):
@@ -205,6 +213,14 @@ Base.metadata.create_all(bind=engine)
 
 
 def ensure_schema():
+    # VSB_BACKEND_V2 materials.image_url
+    try:
+        with engine.begin() as conn:
+            cols = conn.exec_driver_sql("PRAGMA table_info(materials)").fetchall()
+            if not any(c[1] == 'image_url' for c in cols):
+                conn.exec_driver_sql("ALTER TABLE materials ADD COLUMN image_url TEXT DEFAULT ''")
+    except Exception as _e:
+        import logging as _lg; _lg.warning('image_url migration skipped: %s', _e)
     with engine.begin() as conn:
         tables = {
             "materials": ["characteristics", "item_type"],
@@ -365,6 +381,15 @@ class MaterialIn(BaseModel):
     source: str = ""
 
 
+class MaterialUpdateIn(BaseModel):
+    item_type: str | None = None
+    name: str | None = Field(default=None, min_length=1)
+    characteristics: str | None = None
+    unit: str | None = None
+    price: float | None = Field(default=None, ge=0)
+    source: str | None = None
+
+
 class SmetaIn(BaseModel):
     parent_id: int | None = None
     name: str = Field(..., min_length=1)
@@ -493,6 +518,8 @@ def material_to_dict(material):
         "unit": material.unit or "",
         "price": material.price,
         "source": material.source or "",
+        "image_url": getattr(material, "image_url", None) or "",
+        "category": classify_catalog_item(material.name or "", material.source or ""),
         "last_update": material.last_update,
     }
 
@@ -617,6 +644,16 @@ def http_error_detail(exc, fallback):
         detail = response.text
     return f"{fallback}: HTTP {response.status_code}. {str(detail)[:600]}"
 
+
+# # VSB_RULES_INJECT_V1
+import os as _os_rules
+_RULES_PATH = _os_rules.path.join(_os_rules.path.dirname(_os_rules.path.abspath(__file__)), "rules.md")
+def _load_rules():
+    try:
+        with open(_RULES_PATH, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
 
 def read_settings():
     defaults = {
@@ -1087,8 +1124,8 @@ def price_header_priority(header):
         return 75
     if "инст" in label:
         return 55
-    if "розн" in label:
-        return 35
+    if "розн" in label or "ритейл" in label or "rrp" in label or "rrc" in label or "rrc" in label:
+        return 110
     return 0
 
 
@@ -1117,6 +1154,7 @@ def likely_category_row(row, name_index, price_indexes):
 
 
 def pick_price(row, price_indexes):
+    # VSB: user wants RETAIL (highest) price by default — not wholesale.
     prices = []
     for index in price_indexes:
         if index < len(row):
@@ -1125,7 +1163,7 @@ def pick_price(row, price_indexes):
                 prices.append(price)
     if not prices:
         return None
-    return min(prices)
+    return max(prices)
 
 
 def parse_excel_workbook(file_obj, source):
@@ -2517,6 +2555,751 @@ def admin_revoke_access(
     return {"status": "ok"}
 
 
+
+
+# # VSB_BACKEND_LEADS_V1 — leads & quotes
+def _ensure_leads_schema():
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS leads (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                phone TEXT NOT NULL UNIQUE,
+                client_code TEXT NOT NULL UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                source_first TEXT DEFAULT '',
+                notes TEXT DEFAULT ''
+            )
+        """)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                no TEXT NOT NULL,
+                payload TEXT NOT NULL DEFAULT '[]',
+                meta TEXT NOT NULL DEFAULT '{}',
+                total REAL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS chat_messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                lead_id INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+_ensure_leads_schema()
+
+
+def normalize_phone(raw: str) -> str:
+    """Normalize Russian phone to +7XXXXXXXXXX. Returns '' if invalid."""
+    if not raw:
+        return ''
+    digits = ''.join(ch for ch in str(raw) if ch.isdigit())
+    if len(digits) == 11 and digits[0] in ('7', '8'):
+        digits = '7' + digits[1:]
+    elif len(digits) == 10:
+        digits = '7' + digits
+    else:
+        return ''
+    return '+' + digits
+
+
+def _next_client_code(conn) -> str:
+    """K-NNNNNN sequential by max(id)+1."""
+    row = conn.exec_driver_sql("SELECT IFNULL(MAX(id), 0) FROM leads").fetchone()
+    return f"K-{(row[0] or 0) + 1:06d}"
+
+
+def _next_quote_no(conn, lead_id: int, kind: str) -> str:
+    row = conn.exec_driver_sql(
+        "SELECT COUNT(*) FROM quotes WHERE lead_id = ? AND kind = ?",
+        (lead_id, kind),
+    ).fetchone()
+    prefix = {"kp": "КП", "smeta": "СМ", "callback": "ЗВ"}.get(kind, "Q")
+    return f"{prefix}-{(row[0] or 0) + 1:04d}"
+
+
+# ───── Public: register / look up lead by phone ─────
+class LeadIn(BaseModel):
+    phone: str
+    source: str = ""
+
+
+@app.post("/leads")
+def create_or_get_lead(payload: LeadIn):
+    phone = normalize_phone(payload.phone)
+    if not phone:
+        raise HTTPException(status_code=400, detail="Некорректный номер телефона")
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT id, client_code FROM leads WHERE phone = ?", (phone,)
+        ).fetchone()
+        if row:
+            conn.exec_driver_sql(
+                "UPDATE leads SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (row[0],)
+            )
+            return {"id": row[0], "client_code": row[1], "phone": phone, "is_new": False}
+        code = _next_client_code(conn)
+        conn.exec_driver_sql(
+            "INSERT INTO leads (phone, client_code, source_first) VALUES (?, ?, ?)",
+            (phone, code, (payload.source or '')[:120]),
+        )
+        new_id = conn.exec_driver_sql("SELECT last_insert_rowid()").fetchone()[0]
+        return {"id": new_id, "client_code": code, "phone": phone, "is_new": True}
+
+
+class QuoteIn(BaseModel):
+    phone: str
+    kind: str = "smeta"        # smeta | kp | callback
+    payload: list = []         # cart items
+    meta: dict = {}            # KP metadata
+    total: float = 0
+    source: str = ""
+
+
+@app.post("/leads/quote")
+def save_quote(body: QuoteIn):
+    phone = normalize_phone(body.phone)
+    if not phone:
+        raise HTTPException(status_code=400, detail="Некорректный номер телефона")
+    if body.kind not in ("smeta", "kp", "callback"):
+        raise HTTPException(status_code=400, detail="kind must be smeta|kp|callback")
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT id, client_code FROM leads WHERE phone = ?", (phone,)
+        ).fetchone()
+        if row:
+            lead_id, code = row
+            conn.exec_driver_sql(
+                "UPDATE leads SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (lead_id,)
+            )
+        else:
+            code = _next_client_code(conn)
+            conn.exec_driver_sql(
+                "INSERT INTO leads (phone, client_code, source_first) VALUES (?, ?, ?)",
+                (phone, code, (body.source or '')[:120]),
+            )
+            lead_id = conn.exec_driver_sql("SELECT last_insert_rowid()").fetchone()[0]
+        no = _next_quote_no(conn, lead_id, body.kind)
+        conn.exec_driver_sql(
+            "INSERT INTO quotes (lead_id, kind, no, payload, meta, total) VALUES (?, ?, ?, ?, ?, ?)",
+            (lead_id, body.kind, no, json.dumps(body.payload, ensure_ascii=False),
+             json.dumps(body.meta or {}, ensure_ascii=False), float(body.total or 0)),
+        )
+        q_id = conn.exec_driver_sql("SELECT last_insert_rowid()").fetchone()[0]
+    return {
+        "lead_id": lead_id,
+        "client_code": code,
+        "quote_id": q_id,
+        "quote_no": no,
+        "kind": body.kind,
+    }
+
+
+# ───── Admin: leads & quotes ─────
+@app.get("/admin/leads")
+def admin_leads(user: User = Depends(get_current_user)):
+    require_admin_user(user)
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql("""
+            SELECT l.id, l.client_code, l.phone, l.created_at, l.last_seen, l.source_first,
+                   (SELECT COUNT(*) FROM quotes q WHERE q.lead_id = l.id) AS qcount,
+                   (SELECT MAX(total)  FROM quotes q WHERE q.lead_id = l.id) AS maxtotal
+            FROM leads l ORDER BY l.last_seen DESC
+        """).fetchall()
+    return [
+        {"id": r[0], "client_code": r[1], "phone": r[2],
+         "created_at": str(r[3]) if r[3] else None,
+         "last_seen": str(r[4]) if r[4] else None,
+         "source_first": r[5] or "", "quotes_count": r[6] or 0,
+         "max_total": float(r[7] or 0)}
+        for r in rows
+    ]
+
+
+@app.get("/admin/leads/{lead_id}/quotes")
+def admin_lead_quotes(lead_id: int, user: User = Depends(get_current_user)):
+    require_admin_user(user)
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT id, kind, no, payload, meta, total, created_at FROM quotes WHERE lead_id = ? ORDER BY created_at DESC",
+            (lead_id,)
+        ).fetchall()
+        chat = conn.exec_driver_sql(
+            "SELECT role, content, created_at FROM chat_messages WHERE lead_id = ? ORDER BY created_at",
+            (lead_id,)
+        ).fetchall()
+    result = {
+        "quotes": [{
+            "id": r[0], "kind": r[1], "no": r[2],
+            "payload": json.loads(r[3] or "[]"),
+            "meta":    json.loads(r[4] or "{}"),
+            "total":   float(r[5] or 0),
+            "created_at": str(r[6]) if r[6] else None,
+        } for r in rows],
+        "chat": [{"role": r[0], "content": r[1], "at": str(r[2])} for r in chat],
+    }
+    return result
+
+
+# ───── Public AI chat (rate-limited by lead) ─────
+class PublicChatIn(BaseModel):
+    phone: str               # the lead's phone, required for identification
+    message: str = ""
+    cart: list = []          # current cart for context
+    mode: str = "smeta"      # smeta | support
+
+
+_PUBLIC_CHAT_RL = {}          # phone -> [timestamps]
+_PUBLIC_CHAT_WINDOW = 60      # seconds
+_PUBLIC_CHAT_LIMIT  = 10      # messages per window
+
+
+def _rate_limit(key: str) -> bool:
+    import time
+    now = time.time()
+    tracker = _PUBLIC_CHAT_RL.setdefault(key, [])
+    tracker[:] = [t for t in tracker if now - t < _PUBLIC_CHAT_WINDOW]
+    if len(tracker) >= _PUBLIC_CHAT_LIMIT:
+        return False
+    tracker.append(now)
+    return True
+
+
+
+# VSB_BACKEND_RESTORE_V1
+
+# VSB_BACKEND_MEHIST_V1
+
+# VSB_SITE_SETTINGS_V1
+def _ensure_site_settings_schema():
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS site_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        # Seed defaults
+        defaults = {
+            "company_name": "ВСБ39 — Ваша Система Безопасности",
+            "phone":        "+7 (4012) 55-55-55",
+            "email":        "info@vsb39.ru",
+            "address":      "г. Калининград",
+            "ya_maps_key":  "",
+            "ya_maps_coords": "54.7104,20.5128",
+            "ya_metrika_id":"89149915",
+            "ga_id":        "",
+            "ya_webmaster":"",
+            "gsc_token":    "",
+            "calltouch":    "",
+            "inn":          "3912345678",
+        }
+        for k, v in defaults.items():
+            conn.exec_driver_sql(
+                "INSERT INTO site_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                (k, v),
+            )
+_ensure_site_settings_schema()
+
+
+# Допустимые ключи (whitelist)
+_SITE_KEYS = {
+    "company_name","phone","email","address","inn",
+    "ya_maps_key","ya_maps_coords","ya_metrika_id","ga_id",
+    "ya_webmaster","gsc_token","calltouch",
+}
+
+
+
+# VSB_SEO_V1
+def _ensure_seo_schema():
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS seo_pages (
+                slug TEXT PRIMARY KEY,
+                title TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                keywords TEXT NOT NULL DEFAULT '',
+                og_title TEXT NOT NULL DEFAULT '',
+                og_description TEXT NOT NULL DEFAULT '',
+                og_image TEXT NOT NULL DEFAULT '',
+                priority TEXT NOT NULL DEFAULT '0.8',
+                changefreq TEXT NOT NULL DEFAULT 'weekly',
+                indexable INTEGER NOT NULL DEFAULT 1,
+                label TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        seeds = [
+            ("home",    "Главная",    "ВСБ39 — Видеонаблюдение, СКУД, Охранная сигнализация в Калининграде",
+             "Установка и обслуживание систем безопасности в Калининграде: видеонаблюдение, СКУД, ОС/ОТС. 313 объектов, выезд 4 часа, гарантия 6 мес.",
+             "видеонаблюдение Калининград, СКУД Калининград, охранная сигнализация, монтаж камер, ВСБ39, Болид, Орион, техобслуживание ТСО",
+             "1.0", "daily"),
+            ("catalog", "Каталог",    "Каталог оборудования для систем безопасности — ВСБ39 Калининград",
+             "IP-камеры, AHD-камеры, видеорегистраторы, СКУД, охранная сигнализация. Реальные цены, наличие, гарантия.",
+             "каталог камер калининград, ip камеры, ahd камеры, регистраторы, скуд, охранная сигнализация",
+             "0.9", "daily"),
+            ("smeta",   "Смета",      "Калькулятор сметы видеонаблюдения и СКУД онлайн — ВСБ39",
+             "Точный расчёт стоимости системы безопасности под объект. Камеры, NVR, кабель, монтаж, ПНР. КП за 30 секунд.",
+             "калькулятор сметы видеонаблюдение, расчёт стоимости скуд, цена монтажа камер калининград",
+             "0.9", "weekly"),
+            ("about",   "О компании", "ВСБ39 — интегратор систем безопасности в Калининграде",
+             "8+ лет опыта, 313 объектов под ТО, аттестован НПФ Болид и Орион. Калининград и область.",
+             "всб39, интегратор систем безопасности, калининград, болид, орион",
+             "0.7", "monthly"),
+            ("support", "Поддержка",  "Тех. поддержка ВСБ39 — AI-консультант и быстрый отклик",
+             "AI-консультант ответит мгновенно. Сложные вопросы — обратный звонок в течение часа.",
+             "поддержка вебвсб39, помощь по видеонаблюдению",
+             "0.5", "monthly"),
+        ]
+        for s, lbl, t, d, k, p, cf in seeds:
+            conn.exec_driver_sql(
+                "INSERT INTO seo_pages (slug, label, title, description, keywords, priority, changefreq) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(slug) DO NOTHING",
+                (s, lbl, t, d, k, p, cf),
+            )
+        # Расширим site_settings новыми SEO-ключами
+        more_defaults = {
+            "og_image_default": "https://vsb39.ru/og.jpg",
+            "twitter_handle":   "",
+            "geo_lat":          "54.7104",
+            "geo_lng":          "20.5128",
+            "opening_hours":    "Mo-Fr 09:00-18:00",
+            "robots_txt":       "User-agent: *\nDisallow: /to/\nDisallow: /api/\n\nSitemap: https://vsb39.ru/sitemap.xml\n",
+            "base_url":         "https://vsb39.ru",
+        }
+        for k, v in more_defaults.items():
+            conn.exec_driver_sql(
+                "INSERT INTO site_settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
+                (k, v),
+            )
+_ensure_seo_schema()
+_SITE_KEYS |= {"og_image_default","twitter_handle","geo_lat","geo_lng","opening_hours","robots_txt","base_url"}
+
+
+@app.get("/seo/pages")
+def list_seo_pages():
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql(
+            "SELECT slug, label, title, description, keywords, og_title, og_description, og_image, "
+            "priority, changefreq, indexable, updated_at FROM seo_pages ORDER BY priority DESC, slug"
+        ).fetchall()
+    return [{
+        "slug": r[0], "label": r[1] or r[0], "title": r[2], "description": r[3],
+        "keywords": r[4], "og_title": r[5], "og_description": r[6], "og_image": r[7],
+        "priority": r[8], "changefreq": r[9], "indexable": bool(r[10]),
+        "updated_at": str(r[11]) if r[11] else None,
+    } for r in rows]
+
+
+class SeoPageIn(BaseModel):
+    slug: str
+    label: str = ""
+    title: str = ""
+    description: str = ""
+    keywords: str = ""
+    og_title: str = ""
+    og_description: str = ""
+    og_image: str = ""
+    priority: str = "0.8"
+    changefreq: str = "weekly"
+    indexable: bool = True
+
+
+@app.post("/seo/pages")
+def save_seo_page(body: SeoPageIn, user: User = Depends(get_current_user)):
+    require_admin_user(user)
+    slug = (body.slug or "").strip().lower()[:64]
+    if not slug:
+        raise HTTPException(status_code=400, detail="slug обязателен")
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO seo_pages (slug, label, title, description, keywords, og_title, og_description, og_image, priority, changefreq, indexable, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(slug) DO UPDATE SET label=excluded.label, title=excluded.title, description=excluded.description, "
+            "keywords=excluded.keywords, og_title=excluded.og_title, og_description=excluded.og_description, "
+            "og_image=excluded.og_image, priority=excluded.priority, changefreq=excluded.changefreq, "
+            "indexable=excluded.indexable, updated_at=CURRENT_TIMESTAMP",
+            (slug, body.label[:80], body.title[:200], body.description[:500], body.keywords[:500],
+             body.og_title[:200], body.og_description[:500], body.og_image[:500],
+             body.priority[:8], body.changefreq[:16], 1 if body.indexable else 0),
+        )
+    return {"status": "ok", "slug": slug}
+
+
+@app.delete("/seo/pages/{slug}")
+def delete_seo_page(slug: str, user: User = Depends(get_current_user)):
+    require_admin_user(user)
+    with engine.begin() as conn:
+        conn.exec_driver_sql("DELETE FROM seo_pages WHERE slug = ?", (slug,))
+    return {"status": "ok"}
+
+
+@app.get("/sitemap.xml")
+def sitemap_xml():
+    from fastapi.responses import Response
+    with engine.begin() as conn:
+        base = (conn.exec_driver_sql("SELECT value FROM site_settings WHERE key='base_url'").fetchone() or [""])[0] or "https://vsb39.ru"
+        rows = conn.exec_driver_sql(
+            "SELECT slug, priority, changefreq, updated_at FROM seo_pages WHERE indexable = 1 ORDER BY priority DESC"
+        ).fetchall()
+    base = base.rstrip("/")
+    items = []
+    for slug, pri, cf, upd in rows:
+        loc = base + ("/" if slug == "home" else "/#" + slug)
+        items.append(
+            f"  <url>\n    <loc>{loc}</loc>\n    <changefreq>{cf}</changefreq>\n    <priority>{pri}</priority>\n  </url>"
+        )
+    body = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' + "\n".join(items) + "\n</urlset>\n"
+    return Response(content=body, media_type="application/xml")
+
+
+@app.get("/robots.txt")
+def robots_txt():
+    from fastapi.responses import Response
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql("SELECT value FROM site_settings WHERE key='robots_txt'").fetchone()
+    txt = (row[0] if row else "") or "User-agent: *\nDisallow:\n"
+    return Response(content=txt, media_type="text/plain")
+
+@app.get("/site/settings")
+def get_site_settings():
+    """Публичный. API-ключи возвращаем — на фронте они всё равно открыты."""
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql("SELECT key, value FROM site_settings").fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+class SiteSettingsIn(BaseModel):
+    settings: dict
+
+
+@app.post("/site/settings")
+def save_site_settings(body: SiteSettingsIn, user: User = Depends(get_current_user)):
+    require_admin_user(user)
+    payload = body.settings or {}
+    saved = {}
+    with engine.begin() as conn:
+        for k, v in payload.items():
+            if k not in _SITE_KEYS:
+                continue
+            v = str(v if v is not None else "")[:2000]
+            conn.exec_driver_sql(
+                "INSERT INTO site_settings (key, value, updated_at) VALUES (?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP",
+                (k, v),
+            )
+            saved[k] = v
+    return {"status": "ok", "saved": saved}
+
+
+@app.get("/leads/me/history")
+def my_history(
+    phone: str = Query(...),
+    client_code: str = Query(default=""),
+):
+    """Public history fetch — phone + client_code (recommended) для защиты от подбора."""
+    p = normalize_phone(phone)
+    if not p:
+        raise HTTPException(status_code=400, detail="Некорректный номер телефона")
+    with engine.begin() as conn:
+        lead = conn.exec_driver_sql(
+            "SELECT id, client_code, created_at FROM leads WHERE phone = ?", (p,)
+        ).fetchone()
+        if not lead:
+            raise HTTPException(status_code=404, detail="История по этому номеру не найдена")
+        lead_id, code, registered = lead
+        if client_code and client_code.strip().upper() != (code or "").upper():
+            raise HTTPException(status_code=403, detail="Клиентский код не совпадает с номером")
+        quotes = conn.exec_driver_sql(
+            "SELECT id, kind, no, payload, meta, total, created_at FROM quotes "
+            "WHERE lead_id = ? ORDER BY id DESC", (lead_id,)
+        ).fetchall()
+        chat = conn.exec_driver_sql(
+            "SELECT role, content, created_at FROM chat_messages WHERE lead_id = ? ORDER BY id",
+            (lead_id,)
+        ).fetchall()
+        conn.exec_driver_sql("UPDATE leads SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (lead_id,))
+    return {
+        "client_code": code,
+        "registered_at": str(registered) if registered else None,
+        "quotes": [{
+            "id": r[0], "kind": r[1], "no": r[2],
+            "payload": json.loads(r[3] or "[]"),
+            "meta": json.loads(r[4] or "{}"),
+            "total": float(r[5] or 0),
+            "created_at": str(r[6]) if r[6] else None,
+        } for r in quotes],
+        "chat": [{"role": r[0], "content": r[1], "at": str(r[2])} for r in chat],
+    }
+
+
+@app.get("/leads/quote/restore")
+def restore_quote(
+    phone: str = Query(...),
+    quote_no: str = Query(default=""),
+    client_code: str = Query(default=""),
+):
+    p = normalize_phone(phone)
+    if not p:
+        raise HTTPException(status_code=400, detail="Некорректный номер телефона")
+    with engine.begin() as conn:
+        lead = conn.exec_driver_sql(
+            "SELECT id, client_code FROM leads WHERE phone = ?", (p,)
+        ).fetchone()
+        if not lead:
+            raise HTTPException(status_code=404, detail="По этому номеру заявок не найдено")
+        lead_id, code = lead
+        if client_code and client_code.strip().upper() != (code or "").upper():
+            raise HTTPException(status_code=403, detail="Клиентский код не совпадает с номером телефона")
+        if quote_no:
+            row = conn.exec_driver_sql(
+                "SELECT id, kind, no, payload, meta, total, created_at FROM quotes "
+                "WHERE lead_id = ? AND upper(no) = upper(?) ORDER BY id DESC LIMIT 1",
+                (lead_id, quote_no.strip()),
+            ).fetchone()
+        else:
+            row = conn.exec_driver_sql(
+                "SELECT id, kind, no, payload, meta, total, created_at FROM quotes "
+                "WHERE lead_id = ? AND kind IN ('smeta','kp') ORDER BY id DESC LIMIT 1",
+                (lead_id,),
+            ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Смета не найдена")
+    return {
+        "client_code": code,
+        "quote": {
+            "id": row[0],
+            "kind": row[1],
+            "no": row[2],
+            "payload": json.loads(row[3] or "[]"),
+            "meta": json.loads(row[4] or "{}"),
+            "total": float(row[5] or 0),
+            "created_at": str(row[6]) if row[6] else None,
+        },
+    }
+
+
+@app.post("/ai/public/chat")
+def public_ai_chat(body: PublicChatIn):
+    # # VSB_AI_PROACTIVE_V1
+    phone = normalize_phone(body.phone)
+    if not phone:
+        raise HTTPException(status_code=400, detail="Сначала введите телефон")
+    msg = (body.message or "").strip()
+    if not msg:
+        raise HTTPException(status_code=400, detail="Пустой запрос")
+    if len(msg) > 2000:
+        raise HTTPException(status_code=400, detail="Запрос слишком длинный")
+    if not _rate_limit(phone):
+        raise HTTPException(status_code=429, detail="Слишком много запросов, подождите минуту")
+
+    # Ensure lead exists
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql("SELECT id, client_code FROM leads WHERE phone = ?", (phone,)).fetchone()
+        if not row:
+            code = _next_client_code(conn)
+            conn.exec_driver_sql(
+                "INSERT INTO leads (phone, client_code, source_first) VALUES (?, ?, ?)",
+                (phone, code, "ai-chat"),
+            )
+            lead_id = conn.exec_driver_sql("SELECT last_insert_rowid()").fetchone()[0]
+        else:
+            lead_id, code = row
+        conn.exec_driver_sql("UPDATE leads SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (lead_id,))
+
+    # ── Pull recent chat history (last 12 messages) for context continuity ──
+    with engine.begin() as conn:
+        history_rows = conn.exec_driver_sql(
+            "SELECT role, content FROM chat_messages WHERE lead_id = ? ORDER BY id DESC LIMIT 12",
+            (lead_id,),
+        ).fetchall()
+    history_rows = list(reversed(history_rows))  # chronological
+
+    # ── Build catalog context: cheapest items per key category ──
+    def _take_cheapest(db, pred_sql, limit=3):
+        sql = f"SELECT name, price, COALESCE(unit, '') FROM materials WHERE price > 0 AND ({pred_sql}) ORDER BY price ASC LIMIT {limit}"
+        return db.exec_driver_sql(sql).fetchall()
+
+    catalog_lines = []
+    with engine.begin() as conn:
+        groups = [
+            # # VSB_AI_FEATURES_V1
+            # ── Feature-aware groups (на основе характеристик из БД) ──
+            ("Камеры со слотом SD-карты",
+             "name LIKE 'Видеокамер%' AND (lower(characteristics) LIKE '%microsd%' OR lower(characteristics) LIKE '%слот%карт%' OR lower(characteristics) LIKE '%sd-карт%' OR lower(characteristics) LIKE '%sdhc%' OR lower(characteristics) LIKE '%sd card%')"),
+            ("Камеры с микрофоном / аудио",
+             "name LIKE 'Видеокамер%' AND (lower(characteristics) LIKE '%микрофон%' OR lower(characteristics) LIKE '%аудио%' OR lower(name) LIKE '%mic%')"),
+            ("Камеры ColorVu / цветная ночь",
+             "name LIKE 'Видеокамер%' AND (lower(characteristics) LIKE '%colorvu%' OR lower(characteristics) LIKE '%цветн%ноч%' OR lower(characteristics) LIKE '%полноцветн%')"),
+            ("Камеры с обогревом / морозостойкие",
+             "name LIKE 'Видеокамер%' AND (lower(characteristics) LIKE '%обогрев%' OR lower(characteristics) LIKE '%подогрев%' OR lower(characteristics) LIKE '%-50%')"),
+            ("Камеры с WDR (контровой свет)",
+             "name LIKE 'Видеокамер%' AND lower(characteristics) LIKE '%wdr%'"),
+            ("Камеры с PoE",
+             "name LIKE 'Видеокамер%' AND (lower(characteristics) LIKE '%poe%' OR lower(name) LIKE '%poe%')"),
+            ("Камеры с тревожными входами / I-O",
+             "name LIKE 'Видеокамер%' AND (lower(characteristics) LIKE '%тревожн%вход%' OR lower(characteristics) LIKE '%alarm in%')"),
+            ("Камеры с большой ИК-подсветкой (≥30 м)",
+             "name LIKE 'Видеокамер%' AND (lower(characteristics) LIKE '%до 30м%' OR lower(characteristics) LIKE '%до 40м%' OR lower(characteristics) LIKE '%до 50м%' OR lower(characteristics) LIKE '%до 60м%' OR lower(characteristics) LIKE '%до 80м%')"),
+            ("Видеокамеры IP (от дешёвых)",
+             "name LIKE 'Видеокамер%' AND lower(name) LIKE '%ip%'"),
+            ("Видеокамеры AHD",
+             "name LIKE 'Видеокамер%' AND (lower(name) LIKE '%ahd%' OR lower(characteristics) LIKE '%ahd%')"),
+            ("Регистраторы IP",
+             "(name LIKE 'IP-видеорегистратор%' OR name LIKE 'IP видеорегистратор%')"),
+            ("Регистраторы AHD/гибрид",
+             "(name LIKE 'AHD-видеорегистратор%' OR name LIKE 'Цифровой%видеорегистратор%')"),
+            ("PoE-коммутаторы",
+             "name LIKE 'Коммутатор%' AND (lower(name) LIKE '%poe%' OR lower(characteristics) LIKE '%poe%')"),
+            ("Кабель UTP (витая пара)",
+             "name LIKE 'Кабель%' AND (lower(name) LIKE '%utp%' OR lower(name) LIKE '%u5e%' OR lower(name) LIKE '%4x2%' OR lower(characteristics) LIKE '%итая%')"),
+            ("Блоки питания",
+             "name LIKE 'Блок питания%'"),
+            ("Жёсткие диски",
+             "lower(name) LIKE 'hdd%' OR name LIKE '%Жёстк%' OR name LIKE '%жёстк%' OR name LIKE '%Жестк%' OR name LIKE '%жестк%' OR lower(name) LIKE '%seagate%'"),
+            ("Считыватели СКУД",
+             "name LIKE 'Считыватель%'"),
+            ("Электромагнитные замки",
+             "name LIKE 'Электромагнитн%замок%'"),
+            ("Извещатели охранные",
+             "name LIKE 'Извещатель%' OR name LIKE 'Датчик%'"),
+        ]
+        for label, pred in groups:
+            rows = _take_cheapest(conn, pred, limit=3)
+            if rows:
+                catalog_lines.append(f"  {label}:")
+                for r in rows:
+                    nm = (r[0] or "")[:70]
+                    pr = f"{r[1]:.0f}".replace(".0", "")
+                    catalog_lines.append(f"    – {nm} · {pr} ₽" + (f" / {r[2]}" if r[2] else ""))
+
+    catalog_context = "\n".join(catalog_lines)
+    works_context = (
+        "Стандартные работы по системе видеонаблюдения (фиксированные ставки):\n"
+        "  – Монтаж камеры — 2500 ₽/шт\n"
+        "  – Монтаж и ПНР видеорегистратора — 3500 ₽/шт\n"
+        "  – Монтаж PoE-коммутатора — 1700 ₽/шт\n"
+        "  – Прокладка кабеля — 120 ₽/м (норма ~15 м на камеру)\n"
+        "  – Настройка удалённого доступа — 2600 ₽\n"
+        "  – Монтаж точки СКУД — 4500 ₽/комплект\n"
+        "  – Монтаж и ПНР ОС/ОТС — 3500 ₽/извещатель"
+    )
+
+    # ── System prompt: proactive ──
+    settings = read_settings()
+    if body.mode == "support":
+        system = (
+            "Ты — оператор техподдержки ВСБ39, интегратора систем безопасности в Калининграде. "
+            "Отвечай по-русски, дружелюбно, коротко (3-6 предложений), по делу. "
+            "Темы: видеонаблюдение, СКУД, ОС/ОТС, обслуживание, ремонт. "
+            "Если вопрос требует выезда или сложного расчёта — посоветуй оставить заявку через форму на сайте."
+        )
+    else:
+        system = (
+            "Ты — AI-консультант сметчика ВСБ39 (интегратор систем безопасности в Калининграде). "
+            "Главное правило: ОТВЕЧАЙ КОНКРЕТНО, С ЦИФРАМИ ИЗ КАТАЛОГА. Не уходи в общие фразы и не задавай "
+            "более одного уточняющего вопроса подряд.\n\n"
+            "Алгоритм ответа:\n"
+            "1. Если клиент спрашивает цену/расчёт — СРАЗУ собери базовое предложение из каталога (ниже) "
+            "с реальными ₽ и кратким обоснованием. Используй САМЫЕ ДЕШЁВЫЕ позиции категории как «стартовый "
+            "вариант» и обозначь это: «базовый вариант на старте».\n"
+            "2. По умолчанию для видеонаблюдения предлагай ip-систему: ip-камера + ip-NVR + PoE-коммутатор + "
+            "UTP-кабель ~15 м/камера + работы по таблице ниже. Покажи итог.\n"
+            "3. ТОЛЬКО ПОСЛЕ итоговой цифры можно задать ОДИН уточняющий вопрос — например, нужен ли AHD "
+            "вместо IP, или другой бюджет, или нужны ли спецфункции (ColorVu, ИК, поворотные).\n"
+            "4. Если клиент потом отвечает односложно («да», «нет», «дороже», «дешевле») — продолжай тот же "
+            "расчёт с учётом этого ответа, не начинай разговор заново.\n"
+            "5. Никогда не пиши «нужно уточнить, какие именно...» без предложения. Сначала вариант, потом "
+            "вопрос.\n"
+            "6. Округляй цифры до сотен ₽. Используй формат «N × цена ₽ = сумма ₽», в конце «ИТОГО: X ₽».\n"
+            "7. Не выдумывай позиции и цены, которых нет в каталоге ниже.\n"
+            "7b. ТЕХНОЛОГИЯ КАМЕРЫ И NVR ДОЛЖНЫ СОВПАДАТЬ. AHD/TVI/CVI/CVBS-камеры РАБОТАЮТ ТОЛЬКО с AHD/DVR/гибридными видеорегистраторами. IP-камеры (в названии «IP-…» или с PoE/ONVIF) — ТОЛЬКО с IP-NVR (название «IP-видеорегистратор» / «NVR»). НИКОГДА не комбинируй AHD-камеру с IP-NVR или наоборот — система просто не заработает. «IP67» в характеристиках — это степень защиты, НЕ IP-протокол. # VSB_TECH_MATCH_RULE_V1\n"
+            "7a. КАТЕГОРИЧЕСКИ запрещено выдумывать ФУНКЦИИ товара (SD-карта, PoE, ColorVu, WDR, аудио, микрофон, ИК-подсветка дальше N метров, обогрев, антивандальность, мегапиксельность и т.д.). Если пользователь спрашивает про конкретную функцию — ищи в соответствующей фиче-группе каталога ниже. Если в фиче-группе пусто или такой группы нет — отвечай: «В нашем каталоге не нашёл камер с такой функцией. Уточните у менеджера +7 (4012) 55-55-55 — может быть, привезём под заказ». НЕ обещай, что у первой попавшейся камеры есть запрошенная функция.\n"
+            "8. Соблюдай правила подбора из руководства ниже. Если каталог не закрывает требуемую позицию (например, нет ИК-извещателей у поставщика Optimus) — честно скажи об этом и предложи позвонить.\n\n"
+            "═══ РУКОВОДСТВО ПО ПОДБОРУ (внутренний документ ВСБ39) ═══\n" + _load_rules() + "\n\n"
+            "Каталог (актуальные цены, выборка):\n" + catalog_context + "\n\n" + works_context
+        )
+    if settings.get("assistant_prompt"):
+        system = settings["assistant_prompt"] + "\n\n" + system
+
+    # ── Cart context (current) ──
+    cart_text = ""
+    if isinstance(body.cart, list) and body.cart:
+        lines = []
+        total = 0.0
+        for i, it in enumerate(body.cart[:80], 1):
+            try:
+                n  = str(it.get("n", ""))[:80]
+                u  = str(it.get("u", "шт"))
+                q  = float(it.get("q", 0) or 0)
+                p  = float(it.get("p", 0) or 0)
+                s  = p * q
+                total += s
+                lines.append(f"{i}. {n} · {q:g} {u} × {p:g} ₽ = {s:g} ₽")
+            except Exception:
+                pass
+        if lines:
+            cart_text = "\n\nТекущая смета клиента:\n" + "\n".join(lines) + f"\nИТОГО: {total:g} ₽"
+
+    # ── Save user message immediately ──
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO chat_messages (lead_id, role, content) VALUES (?, 'user', ?)",
+            (lead_id, msg),
+        )
+
+    # ── Compose messages: system + history + current ──
+    messages = [{"role": "system", "content": system}]
+    # Limit history to LAST 10 messages, skipping the just-saved user one if present
+    for role, content in history_rows[-10:]:
+        messages.append({"role": role if role in ("user","assistant") else "user", "content": content[:1500]})
+    messages.append({"role": "user", "content": msg + cart_text})
+
+    # ── Call AI ──
+    try:
+        if not settings.get("api_key"):
+            answer = "AI ассистент пока не настроен. Свяжитесь с менеджером: +7 (4012) 55-55-55"
+        else:
+            with httpx.Client(timeout=60) as client:
+                resp = client.post(
+                    endpoint(settings["base_url"], "chat/completions"),
+                    headers=provider_headers(settings),
+                    json={
+                        "model": "openai/gpt-4o-mini",
+                        "messages": messages,
+                        "max_tokens": 800,
+                        "temperature": 0.5,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                answer = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+                if not answer:
+                    answer = "Не удалось получить ответ от AI. Попробуйте переформулировать."
+    except httpx.HTTPError as e:
+        answer = f"Ошибка обращения к AI: {e}"
+    except Exception as e:
+        answer = f"Ошибка: {e}"
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO chat_messages (lead_id, role, content) VALUES (?, 'assistant', ?)",
+            (lead_id, answer[:6000]),
+        )
+
+    return {
+        "client_code": code,
+        "answer": answer,
+    }
+
 @app.get("/sections")
 def read_sections():
     return {"sections": DEFAULT_SECTIONS}
@@ -2530,7 +3313,7 @@ def read_materials(
     technology: str = Query(default=""),
     megapixels: str = Query(default=""),
     price_to: float | None = Query(default=None, ge=0),
-    limit: int = Query(default=200, ge=1, le=500),
+    limit: int = Query(default=500, ge=1),
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
@@ -2572,6 +3355,66 @@ def create_material_endpoint(material: MaterialIn, db: Session = Depends(get_db)
         material.item_type,
     )
     return material_to_dict(created)
+
+
+# VSB_MATERIAL_CRUD_V1
+@app.patch("/materials/{material_id}")
+def update_material_endpoint(
+    material_id: int,
+    payload: MaterialUpdateIn,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_admin_user(user)
+    target = db.query(Material).filter(Material.id == material_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    data = payload.dict(exclude_unset=True)
+    if "name" in data and data["name"]:
+        target.name = data["name"].strip()
+    if "item_type" in data and data["item_type"]:
+        target.item_type = data["item_type"].strip()
+    if "characteristics" in data:
+        target.characteristics = (data["characteristics"] or "").strip()
+    if "unit" in data:
+        target.unit = (data["unit"] or "").strip()
+    if "source" in data:
+        target.source = (data["source"] or "").strip()
+    if "price" in data and data["price"] is not None:
+        target.price = float(data["price"])
+    target.last_update = datetime.datetime.utcnow()
+    db.commit()
+    db.refresh(target)
+    return material_to_dict(target)
+
+
+@app.delete("/materials/{material_id}")
+def delete_material_endpoint(
+    material_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_admin_user(user)
+    target = db.query(Material).filter(Material.id == material_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    db.delete(target)
+    db.commit()
+    return {"status": "ok", "deleted": material_id}
+
+
+@app.delete("/materials")
+def clear_materials_endpoint(
+    confirm: str = Query(default=""),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_admin_user(user)
+    if confirm != "yes":
+        raise HTTPException(status_code=400, detail="Подтвердите очистку каталога: ?confirm=yes")
+    deleted = db.query(Material).delete()
+    db.commit()
+    return {"status": "ok", "deleted": int(deleted)}
 
 
 @app.post("/materials/import")
@@ -2655,6 +3498,160 @@ async def import_materials_with_ai(
             ),
         )
     return {"status": "ok", "imported": imported, "skipped": skipped}
+
+
+
+
+# # VSB_BACKEND_V2 — tinko.ru image lookup
+import re as _re_img
+import urllib.parse as _up_img
+def _extract_significant_tokens(query: str):
+    """Split a product name into significant tokens for catalog search."""
+    return [t for t in _re_img.findall(r"[\w\-./]+", query, _re_img.UNICODE) if not t.isdigit()][:4]
+
+
+def _fetch_optimus_image(query: str) -> str:
+    """Search optimus-cctv.ru (Beget hosting — bypass anti-bot with cookie)."""
+    if not query.strip():
+        return ""
+    tokens = _extract_significant_tokens(query)
+    # Optimus catalog search is sensitive to short codes — try multiple queries
+    queries = []
+    # Find model code like "RA-241E" or "P098"
+    codes = _re_img.findall(r"[A-Z]+[-]?\d+[A-Z0-9]*", query)
+    if codes:
+        queries.append(codes[0])
+    queries.append(" ".join(tokens[:3]) or query[:60])
+    queries.append(" ".join(tokens[:2]))
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "ru,en;q=0.7",
+    }
+    cookies = {"beget": "begetok"}
+    for q in queries:
+        if not q.strip():
+            continue
+        url = "https://optimus-cctv.ru/catalog/?q=" + _up_img.quote(q)
+        try:
+            with httpx.Client(timeout=15, follow_redirects=True, headers=headers, cookies=cookies) as client:
+                r = client.get(url)
+                if r.status_code != 200 or len(r.text) < 5000:
+                    continue
+                html = r.text
+        except Exception:
+            continue
+        # Product cards on optimus-cctv.ru use /images/prev/{hash}_s500x500.jpg
+        m = _re_img.search(r'<img[^>]+(?:src|data-src)="(/images/prev/[^"]+_s500x500\.(?:jpg|jpeg|png|webp))"', html, _re_img.IGNORECASE)
+        if not m:
+            # Fall back to any product image
+            m = _re_img.search(r'<img[^>]+(?:src|data-src)="(/images/prev/[^"]+\.(?:jpg|jpeg|png|webp))"', html, _re_img.IGNORECASE)
+        if m:
+            return "https://optimus-cctv.ru" + m.group(1)
+    return ""
+
+
+def _fetch_tinko_image(query: str) -> str:
+    """Search tinko.ru by query, return first product image URL or ''. (Mostly fails — SPA.)"""
+    if not query.strip():
+        return ""
+    tokens = _extract_significant_tokens(query)
+    q = " ".join(tokens) or query[:60]
+    url = "https://www.tinko.ru/catalog/?q=" + _up_img.quote(q)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (VSB39 catalog image bot)",
+        "Accept": "text/html,application/xhtml+xml",
+        "Accept-Language": "ru,en;q=0.7",
+    }
+    try:
+        with httpx.Client(timeout=15, follow_redirects=True, headers=headers) as client:
+            r = client.get(url)
+            r.raise_for_status()
+            html = r.text
+    except Exception:
+        return ""
+    # Look for product card image patterns. tinko.ru typically uses <img ... src="/upload/...">
+    # Try multiple patterns to be resilient
+    patterns = [
+        r'<a[^>]+class="[^"]*product[^"]*"[^>]*>\s*<img[^>]+src="([^"]+)"',
+        r'<img[^>]+class="[^"]*product[^"]*"[^>]+src="([^"]+)"',
+        r'<img[^>]+src="(/upload/iblock/[^"]+\.(?:jpg|jpeg|png|webp))"',
+        r'data-src="(https?://[^"]+/upload/[^"]+\.(?:jpg|jpeg|png|webp))"',
+        r'<img[^>]+src="(https?://[^"]+/upload/[^"]+\.(?:jpg|jpeg|png|webp))"',
+    ]
+    for pat in patterns:
+        m = _re_img.search(pat, html, _re_img.IGNORECASE)
+        if m:
+            src_url = m.group(1)
+            if src_url.startswith("/"):
+                src_url = "https://www.tinko.ru" + src_url
+            # Skip ui/spinner/placeholder icons
+            if any(s in src_url.lower() for s in ("noimage", "no-image", "placeholder", "loader", "spinner")):
+                continue
+            return src_url
+    return ""
+
+
+
+
+
+# # VSB_IMG_OPTIMUS_V1 — dispatch image lookup by supplier
+def _fetch_image_for_material(material) -> str:
+    """Pick best image source based on Material.source / name."""
+    name = (getattr(material, "name", "") or "").strip()
+    src_field = (getattr(material, "source", "") or "").lower()
+    # Optimus prices route to optimus-cctv.ru
+    if "optimus" in src_field or "оптимус" in src_field or " el " in (" " + name.lower() + " "):
+        img = _fetch_optimus_image(name)
+        if img:
+            return img
+    # Anything else (or Optimus miss) — try tinko (best-effort)
+    img = _fetch_tinko_image(name)
+    if img:
+        return img
+    # Last resort — try optimus even if source isn't tagged (catches mis-labeled rows)
+    return _fetch_optimus_image(name)
+
+@app.post("/materials/{material_id}/fetch-image")
+def fetch_material_image(
+    material_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_admin_user(user)
+    target = db.query(Material).filter(Material.id == material_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="Позиция не найдена")
+    img = _fetch_image_for_material(target)
+    if not img:
+        return {"status": "not_found", "image_url": ""}
+    target.image_url = img
+    db.commit()
+    return {"status": "ok", "image_url": img}
+
+
+@app.post("/materials/fetch-images-bulk")
+def fetch_images_bulk(
+    limit: int = Query(default=20, ge=1, le=200),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_admin_user(user)
+    # Pick materials with empty image_url
+    rows = db.query(Material).filter(
+        (Material.image_url == None) | (Material.image_url == "")  # noqa: E711
+    ).limit(limit).all()
+    found = 0
+    failed = 0
+    for mat in rows:
+        img = _fetch_image_for_material(mat)
+        if img:
+            mat.image_url = img
+            found += 1
+        else:
+            failed += 1
+    db.commit()
+    return {"status": "ok", "processed": len(rows), "found": found, "failed": failed}
 
 
 @app.get("/smetas")
