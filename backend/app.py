@@ -3000,6 +3000,314 @@ def save_site_settings(body: SiteSettingsIn, user: User = Depends(get_current_us
     return {"status": "ok", "saved": saved}
 
 
+
+# VSB_VOICE_V1
+def _ensure_voice_schema():
+    with engine.begin() as conn:
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS voice_calls (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider_call_id TEXT UNIQUE,
+                lead_id INTEGER,
+                direction TEXT NOT NULL DEFAULT 'in',
+                phone TEXT NOT NULL,
+                started_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                ended_at TIMESTAMP,
+                duration_sec INTEGER DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'active',
+                recording_url TEXT,
+                summary TEXT,
+                category TEXT,
+                manager_status TEXT DEFAULT 'new',
+                raw_payload TEXT DEFAULT '{}'
+            )
+        """)
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS voice_dialog_turns (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                call_id INTEGER NOT NULL,
+                turn_no INTEGER NOT NULL,
+                role TEXT NOT NULL,
+                text TEXT NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.exec_driver_sql("CREATE INDEX IF NOT EXISTS idx_turns_call ON voice_dialog_turns(call_id)")
+_ensure_voice_schema()
+
+
+# ── Pydantic ──
+class CallStartIn(BaseModel):
+    call_id: str
+    caller_phone: str
+    direction: str = "in"   # in | out
+
+
+class CallTurnIn(BaseModel):
+    call_id: str
+    transcript: str = ""
+
+
+class CallEndIn(BaseModel):
+    call_id: str
+    duration_sec: int = 0
+    recording_url: str = ""
+
+
+# ── AI dialog config ──
+_VOICE_SYSTEM_PROMPT = (
+    "Ты — оператор компании ВСБ39 (системы безопасности в Калининграде) на телефоне. "
+    "Говоришь по-русски, ВЕЖЛИВО и КРАТКО — максимум 2 коротких предложения за реплику. "
+    "Звонят клиенты в нерабочее время или по запросу обратного звонка. "
+    "Твоя цель за 3-5 реплик: понять (1) что нужно — видеонаблюдение / СКУД / охранная сигнализация / "
+    "ремонт-обслуживание / другое; (2) тип и размер объекта (если уместно). "
+    "Не давай конкретных цен — для этого утром перезвонит менеджер. "
+    "Когда соберёшь достаточно, скажи: 'Спасибо, передам менеджеру, перезвоним вам в рабочее время. До свидания.' "
+    "И в этой реплике добавь в самом конце технический маркер [HANGUP]. "
+    "Если клиент злится / просит человека / сложный вопрос — сразу: 'Передам срочно менеджеру.' и [HANGUP]. "
+    "НЕ обещай и не выдумывай факты о компании."
+)
+
+
+def _call_voice_ai(turns):
+    """turns: list of {role, text}. Возвращает (текст_ответа, hangup_bool)."""
+    settings = read_settings()
+    if not settings.get("api_key"):
+        return ("AI не настроен. До свидания.", True)
+    messages = [{"role": "system", "content": _VOICE_SYSTEM_PROMPT}]
+    for t in turns:
+        role = "user" if t["role"] == "user" else "assistant"
+        messages.append({"role": role, "content": t["text"][:1500]})
+    try:
+        with httpx.Client(timeout=20) as client:
+            r = client.post(
+                endpoint(settings["base_url"], "chat/completions"),
+                headers=provider_headers(settings),
+                json={
+                    "model": "openai/gpt-4o-mini",
+                    "messages": messages,
+                    "max_tokens": 200,
+                    "temperature": 0.4,
+                },
+            )
+            r.raise_for_status()
+            txt = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    except Exception as e:
+        return (f"Извините, технический сбой. Передам менеджеру. До свидания.", True)
+    hangup = "[HANGUP]" in txt
+    txt = txt.replace("[HANGUP]", "").strip()
+    return (txt or "До свидания.", hangup)
+
+
+def _ensure_lead(conn, phone):
+    p = normalize_phone(phone)
+    if not p:
+        return (None, None)
+    row = conn.exec_driver_sql("SELECT id, client_code FROM leads WHERE phone = ?", (p,)).fetchone()
+    if row:
+        conn.exec_driver_sql("UPDATE leads SET last_seen = CURRENT_TIMESTAMP WHERE id = ?", (row[0],))
+        return (row[0], row[1])
+    code = _next_client_code(conn)
+    conn.exec_driver_sql(
+        "INSERT INTO leads (phone, client_code, source_first) VALUES (?, ?, ?)",
+        (p, code, "voice-call"),
+    )
+    return (conn.exec_driver_sql("SELECT last_insert_rowid()").fetchone()[0], code)
+
+
+@app.post("/voice/call/start")
+def voice_call_start(body: CallStartIn):
+    """Провайдер шлёт когда трубка снята. Возвращаем фразу для TTS."""
+    with engine.begin() as conn:
+        lead_id, code = _ensure_lead(conn, body.caller_phone)
+        # Idempotent: если call_id уже есть — возвращаем «продолжение»
+        existing = conn.exec_driver_sql(
+            "SELECT id FROM voice_calls WHERE provider_call_id = ?", (body.call_id,)
+        ).fetchone()
+        if existing:
+            call_id = existing[0]
+        else:
+            conn.exec_driver_sql(
+                "INSERT INTO voice_calls (provider_call_id, lead_id, direction, phone, status) "
+                "VALUES (?, ?, ?, ?, 'active')",
+                (body.call_id, lead_id, body.direction, normalize_phone(body.caller_phone) or body.caller_phone),
+            )
+            call_id = conn.exec_driver_sql("SELECT last_insert_rowid()").fetchone()[0]
+
+    # Первая реплика AI — не зовём GPT, говорим заранее заготовленную (быстрее)
+    greeting = (
+        "Здравствуйте! Вы дозвонились в ВСБ39 — системы безопасности Калининград. "
+        "Сейчас нерабочее время, но я — AI-консультант, и постараюсь помочь. "
+        "Расскажите, пожалуйста, что вас интересует?"
+    )
+    if body.direction == "out":
+        greeting = (
+            "Здравствуйте! Это ВСБ39, перезваниваем по вашей заявке с сайта. "
+            "Подскажите, по какому вопросу обращались?"
+        )
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO voice_dialog_turns (call_id, turn_no, role, text) VALUES (?, 1, 'assistant', ?)",
+            (call_id, greeting),
+        )
+    return {"ai_say": greeting, "expect_input": True, "internal_call_id": call_id}
+
+
+@app.post("/voice/call/turn")
+def voice_call_turn(body: CallTurnIn):
+    """После распознавания фразы клиента — генерируем ответ AI."""
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT id FROM voice_calls WHERE provider_call_id = ?", (body.call_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Call not found")
+        call_id = row[0]
+        # Сохраняем фразу клиента
+        next_turn = conn.exec_driver_sql(
+            "SELECT IFNULL(MAX(turn_no), 0) + 1 FROM voice_dialog_turns WHERE call_id = ?", (call_id,)
+        ).fetchone()[0]
+        conn.exec_driver_sql(
+            "INSERT INTO voice_dialog_turns (call_id, turn_no, role, text) VALUES (?, ?, 'user', ?)",
+            (call_id, next_turn, (body.transcript or "")[:2000]),
+        )
+        # Берём всю историю для AI
+        turns = [{"role": r[0], "text": r[1]} for r in conn.exec_driver_sql(
+            "SELECT role, text FROM voice_dialog_turns WHERE call_id = ? ORDER BY turn_no",
+            (call_id,)
+        ).fetchall()]
+
+    ai_say, hangup = _call_voice_ai(turns)
+    # Если AI идёт на hangup — после 5 реплик клиента или сам решил
+    user_turn_count = sum(1 for t in turns if t["role"] == "user")
+    if user_turn_count >= 5:
+        hangup = True
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO voice_dialog_turns (call_id, turn_no, role, text) VALUES (?, ?, 'assistant', ?)",
+            (call_id, next_turn + 1, ai_say),
+        )
+    return {"ai_say": ai_say, "expect_input": not hangup, "hangup": hangup}
+
+
+@app.post("/voice/call/end")
+def voice_call_end(body: CallEndIn):
+    """Звонок завершён. Финализация: summary + категория проблемы."""
+    with engine.begin() as conn:
+        row = conn.exec_driver_sql(
+            "SELECT id FROM voice_calls WHERE provider_call_id = ?", (body.call_id,)
+        ).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Call not found")
+        call_id = row[0]
+        turns = [{"role": r[0], "text": r[1]} for r in conn.exec_driver_sql(
+            "SELECT role, text FROM voice_dialog_turns WHERE call_id = ? ORDER BY turn_no",
+            (call_id,)
+        ).fetchall()]
+
+    # Summary через GPT
+    settings = read_settings()
+    summary = ""
+    category = "other"
+    if settings.get("api_key") and turns:
+        transcript_text = "\n".join(f"[{t['role']}] {t['text']}" for t in turns)
+        try:
+            with httpx.Client(timeout=20) as client:
+                r = client.post(
+                    endpoint(settings["base_url"], "chat/completions"),
+                    headers=provider_headers(settings),
+                    json={
+                        "model": "openai/gpt-4o-mini",
+                        "messages": [
+                            {"role": "system", "content":
+                                "Ты ассистент, обрабатывающий запись звонка в компанию ВСБ39. "
+                                "Дай ответ строго в формате двух строк:\n"
+                                "SUMMARY: <одно предложение, что хочет клиент>\n"
+                                "CATEGORY: <одно слово: видеонаблюдение | скуд | сигнализация | то | другое>"},
+                            {"role": "user", "content": "Транскрипт:\n" + transcript_text}
+                        ],
+                        "max_tokens": 200,
+                        "temperature": 0.2,
+                    },
+                )
+                r.raise_for_status()
+                ans = (r.json().get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+                for line in ans.splitlines():
+                    if line.upper().startswith("SUMMARY:"):
+                        summary = line.split(":", 1)[1].strip()
+                    elif line.upper().startswith("CATEGORY:"):
+                        category = line.split(":", 1)[1].strip().lower()
+        except Exception:
+            pass
+
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE voice_calls SET ended_at = CURRENT_TIMESTAMP, duration_sec = ?, "
+            "recording_url = ?, summary = ?, category = ?, status = 'done' "
+            "WHERE id = ?",
+            (int(body.duration_sec or 0), body.recording_url or "", summary, category, call_id),
+        )
+    return {"status": "ok", "summary": summary, "category": category}
+
+
+# ── Admin ──
+@app.get("/admin/voice/calls")
+def admin_voice_calls(user: User = Depends(get_current_user)):
+    require_admin_user(user)
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql("""
+            SELECT v.id, v.provider_call_id, l.client_code, v.phone, v.direction, v.started_at, v.duration_sec,
+                   v.status, v.summary, v.category, v.manager_status, v.recording_url
+              FROM voice_calls v LEFT JOIN leads l ON l.id = v.lead_id
+             ORDER BY v.started_at DESC LIMIT 200
+        """).fetchall()
+    return [{
+        "id": r[0], "provider_call_id": r[1], "client_code": r[2] or "",
+        "phone": r[3], "direction": r[4], "started_at": str(r[5]) if r[5] else None,
+        "duration_sec": r[6] or 0, "status": r[7], "summary": r[8] or "",
+        "category": r[9] or "", "manager_status": r[10] or "new",
+        "recording_url": r[11] or "",
+    } for r in rows]
+
+
+@app.get("/admin/voice/calls/{call_id}")
+def admin_voice_call_detail(call_id: int, user: User = Depends(get_current_user)):
+    require_admin_user(user)
+    with engine.begin() as conn:
+        cr = conn.exec_driver_sql("SELECT * FROM voice_calls WHERE id = ?", (call_id,)).fetchone()
+        if not cr:
+            raise HTTPException(status_code=404, detail="Not found")
+        cols = ["id","provider_call_id","lead_id","direction","phone","started_at","ended_at",
+                "duration_sec","status","recording_url","summary","category","manager_status","raw_payload"]
+        call = dict(zip(cols, cr))
+        for k in ("started_at", "ended_at"):
+            if call.get(k) is not None: call[k] = str(call[k])
+        turns = conn.exec_driver_sql(
+            "SELECT turn_no, role, text, created_at FROM voice_dialog_turns WHERE call_id = ? ORDER BY turn_no",
+            (call_id,)
+        ).fetchall()
+    return {
+        "call": call,
+        "turns": [{"turn_no": r[0], "role": r[1], "text": r[2], "at": str(r[3])} for r in turns],
+    }
+
+
+class CallStatusIn(BaseModel):
+    manager_status: str  # new | in_work | contacted | done | refused
+
+
+@app.patch("/admin/voice/calls/{call_id}/status")
+def admin_voice_call_status(call_id: int, body: CallStatusIn, user: User = Depends(get_current_user)):
+    require_admin_user(user)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE voice_calls SET manager_status = ? WHERE id = ?",
+            (body.manager_status[:20], call_id)
+        )
+    return {"status": "ok"}
+
 @app.get("/leads/me/history")
 def my_history(
     phone: str = Query(...),
