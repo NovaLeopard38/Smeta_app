@@ -3004,7 +3004,7 @@ def save_site_settings(body: SiteSettingsIn, user: User = Depends(get_current_us
 # VSB_VOICE_V1
 # VSB_TINKOFF_VOICEKIT_V1
 # Расширяем whitelist site_settings ключей для Tinkoff VoiceKit
-_SITE_KEYS |= {"tinkoff_api_key", "tinkoff_secret_key", "tinkoff_voice", "tinkoff_endpoint"}
+_SITE_KEYS |= {"tinkoff_api_key", "tinkoff_secret_key", "tinkoff_voice", "tinkoff_endpoint", "tts_provider", "tts_model", "tts_voice"}
 
 
 def _site_get(key, default=""):
@@ -3057,15 +3057,13 @@ def _tk_stt(audio_bytes: bytes, sample_rate: int = 8000, language: str = "ru-RU"
     try:
         with httpx.Client(timeout=60) as c:
             r = c.post(url, headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}, json=payload)
-            r.raise_for_status()
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"Tinkoff STT HTTP {r.status_code}: {r.text[:500]}")
             data = r.json()
-    except httpx.HTTPError as e:
-        body = ""
-        try:
-            body = e.response.text[:300]
-        except Exception:
-            pass
-        raise HTTPException(status_code=502, detail=f"Tinkoff STT error: {e} {body}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Tinkoff STT network error: {e!r}")
     results = data.get("results") or []
     if not results:
         return ""
@@ -3090,17 +3088,64 @@ def _tk_tts(text: str, voice: str = "", sample_rate: int = 8000, encoding: str =
     try:
         with httpx.Client(timeout=60) as c:
             r = c.post(url, headers={"Authorization": f"Bearer {jwt}", "Content-Type": "application/json"}, json=payload)
-            r.raise_for_status()
+            if r.status_code != 200:
+                detail = f"Tinkoff TTS HTTP {r.status_code}: {r.text[:500]}"
+                raise HTTPException(status_code=502, detail=detail)
             data = r.json()
-    except httpx.HTTPError as e:
-        body = ""
-        try:
-            body = e.response.text[:300]
-        except Exception:
-            pass
-        raise HTTPException(status_code=502, detail=f"Tinkoff TTS error: {e} {body}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Tinkoff TTS network error: {e!r}")
     import base64 as _b
     return _b.b64decode(data.get("audio_content", ""))
+
+
+# # VSB_TTS_FALLBACK_V1
+def _vsegpt_tts(text: str, voice: str = "", encoding: str = "MPEG_AUDIO", sample_rate: int = 16000) -> bytes:
+    """Синтез через ВсеГПТ (OpenAI tts-1 / vosk-tts). Возвращает MP3 (или wav для vosk)."""
+    settings = read_settings()
+    if not settings.get("api_key"):
+        raise HTTPException(status_code=400, detail="ВсеГПТ API-ключ не настроен")
+    model = (_site_get("tts_model") or "tts-1").strip()
+    if not voice:
+        voice = (_site_get("tts_voice") or "alloy").strip()
+    fmt = "mp3" if encoding == "MPEG_AUDIO" else ("wav" if encoding == "LINEAR16" else "mp3")
+    payload = {
+        "model": model,
+        "input": text[:4000],
+        "voice": voice,
+        "response_format": fmt,
+    }
+    try:
+        with httpx.Client(timeout=60) as c:
+            r = c.post(
+                endpoint(settings["base_url"], "audio/speech"),
+                headers=provider_headers(settings),
+                json=payload,
+            )
+            if r.status_code != 200:
+                raise HTTPException(status_code=502, detail=f"ВсеГПТ TTS HTTP {r.status_code}: {r.text[:500]}")
+            return r.content
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"ВсеГПТ TTS error: {e!r}")
+
+
+def _tts_dispatch(text: str, voice: str = "", encoding: str = "MPEG_AUDIO", sample_rate: int = 8000) -> bytes:
+    """Точка единого синтеза. По умолчанию через ВсеГПТ (работает у всех)."""
+    provider = (_site_get("tts_provider") or "vsegpt").strip().lower()
+    if provider == "tinkoff":
+        try:
+            return _tk_tts(text, voice=voice, encoding=encoding, sample_rate=sample_rate)
+        except HTTPException as e:
+            # Auto-fallback на ВсеГПТ если Tinkoff TTS не доступен
+            if e.status_code == 502 and ("403" in (e.detail or "") or "denied" in (e.detail or "").lower()):
+                pass  # fall through to vsegpt
+            else:
+                raise
+    # ВсеГПТ
+    return _vsegpt_tts(text, voice=voice, encoding=encoding, sample_rate=sample_rate)
 
 
 # ── Endpoints ──
@@ -3131,6 +3176,44 @@ class TTSIn(BaseModel):
     encoding: str = "LINEAR16"   # или MPEG_AUDIO для mp3
 
 
+# # VSB_VOICEKIT_DEBUG_V1
+@app.get("/voice/debug/jwt")
+def voice_debug_jwt(user: User = Depends(get_current_user)):
+    """Admin-only: вернуть JWT для TTS и его декодированные части — для отладки на jwt.io"""
+    require_admin_user(user)
+    api_key = _site_get("tinkoff_api_key").strip()
+    secret = _site_get("tinkoff_secret_key").strip()
+    info = {
+        "api_key_set": bool(api_key),
+        "api_key_len": len(api_key),
+        "api_key_preview": (api_key[:6] + "..." + api_key[-4:]) if len(api_key) > 10 else api_key,
+        "secret_set": bool(secret),
+        "secret_len": len(secret),
+        "endpoint_base": _tk_base(),
+    }
+    if not api_key or not secret:
+        info["error"] = "Заполните оба ключа в админке"
+        return info
+    try:
+        jwt_tts = _tk_jwt("tinkoff.cloud.tts")
+        jwt_stt = _tk_jwt("tinkoff.cloud.stt")
+        import json as _json, base64 as _b
+        def _decode(t):
+            parts = t.split(".")
+            if len(parts) != 3: return {"raw": t}
+            def b64d(s):
+                pad = "=" * (-len(s) % 4)
+                try:    return _json.loads(_b.urlsafe_b64decode(s + pad).decode())
+                except: return {"raw": s}
+            return {"header": b64d(parts[0]), "payload": b64d(parts[1]), "sig_first_8": parts[2][:8]}
+        info["jwt_tts"] = jwt_tts
+        info["jwt_tts_decoded"] = _decode(jwt_tts)
+        info["jwt_stt_decoded"] = _decode(jwt_stt)
+    except Exception as e:
+        info["jwt_error"] = repr(e)
+    return info
+
+
 @app.post("/voice/tts")
 def voice_tts(body: TTSIn):
     """Синтез речи. Возвращает audio как байты (Content-Type зависит от encoding)."""
@@ -3138,7 +3221,7 @@ def voice_tts(body: TTSIn):
         raise HTTPException(status_code=400, detail="text пустой")
     if len(body.text) > 4000:
         raise HTTPException(status_code=400, detail="text > 4000 символов")
-    audio = _tk_tts(body.text, voice=body.voice, sample_rate=body.sample_rate, encoding=body.encoding)
+    audio = _tts_dispatch(body.text, voice=body.voice, sample_rate=body.sample_rate, encoding=body.encoding)
     ct = {"LINEAR16": "audio/wav", "MPEG_AUDIO": "audio/mpeg", "ALAW": "audio/x-alaw-basic"}.get(body.encoding, "application/octet-stream")
     # Для LINEAR16 нужна wav-обёртка, чтобы плееры понимали
     if body.encoding == "LINEAR16":
@@ -3201,13 +3284,13 @@ def voice_dialog(body: VoiceDialogIn):
                 "INSERT INTO voice_dialog_turns (call_id, turn_no, role, text) VALUES (?, 1, 'assistant', ?)",
                 (cid, greeting),
             )
-        audio = _tk_tts(greeting, sample_rate=8000, encoding="MPEG_AUDIO")
+        audio = _tts_dispatch(greeting, sample_rate=8000, encoding="MPEG_AUDIO")
         import base64 as _b
         return {"ai_text": greeting, "audio_mp3_b64": _b.b64encode(audio).decode(), "hangup": False}
 
     # Иначе — это очередная реплика; идём по логике /voice/call/turn
     res = voice_call_turn(CallTurnIn(call_id=body.call_id, transcript=body.transcript))
-    audio = _tk_tts(res["ai_say"], sample_rate=8000, encoding="MPEG_AUDIO")
+    audio = _tts_dispatch(res["ai_say"], sample_rate=8000, encoding="MPEG_AUDIO")
     import base64 as _b
     return {
         "ai_text": res["ai_say"],
