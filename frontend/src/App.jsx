@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { BrowserRouter, Routes, Route, Navigate, useNavigate, useLocation } from "react-router-dom";
 import * as api from "./api";
 import { useSmetas } from "./hooks/useSmetas";
 import { useMaterials } from "./hooks/useMaterials";
@@ -7,6 +8,7 @@ import { useAdmin } from "./hooks/useAdmin";
 import { money, isWorkMaterial, wholeQuantityInput, parentIdOf, hasManualPrice, compactDetails, hasLongDetails, buildSmetaTree, buildGroupedItems } from "./utils";
 import { ThemeProvider } from "./context/ThemeContext";
 import { AuthProvider, useAuthContext } from "./context/AuthContext";
+import { PrivateRoute } from "./components/layout/PrivateRoute";
 import LoginForm from "./components/auth/LoginForm";
 import TopBar from "./components/layout/TopBar";
 import SmetaList from "./components/smetas/SmetaList";
@@ -16,7 +18,10 @@ import AssistantPage from "./components/assistant/AssistantPage";
 import AdminPage from "./components/admin/AdminPage";
 
 function AppContent() {
-  const [activePage, setActivePage] = useState("smetas");
+  const navigate = useNavigate();
+  const location = useLocation();
+  const activePage = location.pathname.replace("/", "") || "smetas";
+
   const [shellSearch, setShellSearch] = useState("");
   const [shellSearchSuggestions, setShellSearchSuggestions] = useState([]);
   const [shellSearchFocused, setShellSearchFocused] = useState(false);
@@ -43,7 +48,7 @@ function AppContent() {
   }, [authToken]); // eslint-disable-line
 
   useEffect(() => { if (authToken && currentUser?.is_admin) ai.loadAiSettings(); }, [authToken, currentUser?.is_admin]); // eslint-disable-line
-  useEffect(() => { if (activePage === "admin" && !currentUser?.is_admin) setActivePage("smetas"); }, [activePage, currentUser?.is_admin]);
+  useEffect(() => { if (activePage === "admin" && !currentUser?.is_admin) navigate("/smetas", { replace: true }); }, [activePage, currentUser?.is_admin]); // eslint-disable-line
 
   useEffect(() => {
     if (!authToken || activePage !== "smetas") { sm.setItemSuggestions([]); return undefined; }
@@ -81,9 +86,9 @@ function AppContent() {
     ? sm.smetas.filter(s => { const t = (s.items || []).slice(0, 12).map(i => `${i.name || ""} ${i.characteristics || ""}`).join(" "); return [s.name, s.customer_name, s.contractor_name, s.approver_name, t].join(" ").toLowerCase().includes(shellQ); }).slice(0, 5) : [];
   const shellHasResults = smetaSearchResults.length > 0 || shellSearchSuggestions.length > 0;
   const handleShellSuggestionAdd = async (m) => { await sm.handleAddMaterialToSmeta(m); setShellSearch(""); setShellSearchSuggestions([]); setShellSearchFocused(false); };
-  const handleShellSuggestionOpen = (m) => { const q = m.name || shellSearch.trim(); setShellSearch(q); mat.setMaterialQuery(q); setActivePage("prices"); setShellSearchFocused(false); };
-  const handleShellSmetaOpen = (s) => { sm.setSelectedSmetaId(String(s.id)); setActivePage("smetas"); setShellSearch(""); setShellSearchSuggestions([]); setShellSearchFocused(false); };
-  const handleShellSearchKeyDown = (e) => { if (e.key !== "Enter") return; e.preventDefault(); const q = shellSearch.trim(); if (q) { mat.setMaterialQuery(q); setActivePage("prices"); setShellSearchFocused(false); } };
+  const handleShellSuggestionOpen = (m) => { const q = m.name || shellSearch.trim(); setShellSearch(q); mat.setMaterialQuery(q); navigate("/prices"); setShellSearchFocused(false); };
+  const handleShellSmetaOpen = (s) => { sm.setSelectedSmetaId(String(s.id)); navigate("/smetas"); setShellSearch(""); setShellSearchSuggestions([]); setShellSearchFocused(false); };
+  const handleShellSearchKeyDown = (e) => { if (e.key !== "Enter") return; e.preventDefault(); const q = shellSearch.trim(); if (q) { mat.setMaterialQuery(q); navigate("/prices"); setShellSearchFocused(false); } };
 
   if (!authToken) {
     return <LoginForm onLogin={() => auth.handleLogin(setError, setMessage)} onRegister={() => auth.handleRegister(setError, setMessage)} message={message} error={error} />;
@@ -92,24 +97,29 @@ function AppContent() {
   return (
     <main className="app-shell shell-layout h-layout">
       <div className="main-shell">
-        <TopBar currentUser={currentUser} activePage={activePage} setActivePage={setActivePage} pageItems={pageItems} currentPageMeta={currentPageMeta} handleLogout={handleLogout} previewSmeta={sm.previewSmeta} money={money} shellSearch={shellSearch} setShellSearch={setShellSearch} shellSearchFocused={shellSearchFocused} setShellSearchFocused={setShellSearchFocused} shellHasResults={shellHasResults} smetaSearchResults={smetaSearchResults} shellSearchSuggestions={shellSearchSuggestions} handleShellSearchKeyDown={handleShellSearchKeyDown} handleShellSmetaOpen={handleShellSmetaOpen} handleShellSuggestionOpen={handleShellSuggestionOpen} handleShellSuggestionAdd={handleShellSuggestionAdd} parentIdOf={parentIdOf} isWorkMaterial={isWorkMaterial} />
+        <TopBar currentUser={currentUser} activePage={activePage} pageItems={pageItems} currentPageMeta={currentPageMeta} handleLogout={handleLogout} previewSmeta={sm.previewSmeta} money={money} shellSearch={shellSearch} setShellSearch={setShellSearch} shellSearchFocused={shellSearchFocused} setShellSearchFocused={setShellSearchFocused} shellHasResults={shellHasResults} smetaSearchResults={smetaSearchResults} shellSearchSuggestions={shellSearchSuggestions} handleShellSearchKeyDown={handleShellSearchKeyDown} handleShellSmetaOpen={handleShellSmetaOpen} handleShellSuggestionOpen={handleShellSuggestionOpen} handleShellSuggestionAdd={handleShellSuggestionAdd} parentIdOf={parentIdOf} isWorkMaterial={isWorkMaterial} />
         <main className="content">
           {(message || error) && <div className={error ? "notice error" : "notice"}>{error || message}</div>}
-          {activePage === "smetas" && (
-            <section className="workspace">
-              <SmetaList smetas={sm.smetas} smetaTree={smetaTree} selectedSmetaId={sm.selectedSmetaId} setSelectedSmetaId={sm.setSelectedSmetaId} expandedSmetaIds={sm.expandedSmetaIds} setExpandedSmetaIds={sm.setExpandedSmetaIds} smetaName={sm.smetaName} setSmetaName={sm.setSmetaName} handleCreateSmeta={sm.handleCreateSmeta} money={money} parentIdOf={parentIdOf} />
-              <SmetaEditor selectedSmeta={sm.selectedSmeta} previewSmeta={sm.previewSmeta} groupedItems={groupedItems} sections={mat.sections} smetaDetails={sm.smetaDetails} updateSmetaDetails={sm.updateSmetaDetails} updateSectionAdjustment={sm.updateSectionAdjustment} handleSaveSmetaDetails={sm.handleSaveSmetaDetails} shareForm={sm.shareForm} setShareForm={sm.setShareForm} handleShareSmeta={() => sm.handleShareSmeta(adm.loadAdminData)} handleBranchSmeta={sm.handleBranchSmeta} handleCheckSmeta={() => sm.handleCheckSmeta(ai.setAiResponse)} handleExportExcel={sm.handleExportExcel} handlePrintSmeta={sm.handlePrintSmeta} handleDeleteSmeta={sm.handleDeleteSmeta} itemForm={sm.itemForm} updateItemForm={sm.updateItemForm} itemSuggestions={sm.itemSuggestions} handleAddCustomItem={sm.handleAddCustomItem} handleAddSuggestedItem={sm.handleAddSuggestedItem} handleDeleteItem={sm.handleDeleteItem} updateItemDraft={sm.updateItemDraft} getItemDraft={sm.getItemDraft} commitItemDraft={sm.commitItemDraft} expandedItems={sm.expandedItems} toggleItem={sm.toggleItem} aiPrompt={ai.aiPrompt} setAiPrompt={ai.setAiPrompt} handleAiRequest={() => ai.handleAiRequest(sm.selectedSmeta, sm.setSmetas, sm.setSelectedSmetaId)} adminAccess={adm.adminAccess} adminBusy={adm.adminBusy} handleRevokeAccess={adm.handleRevokeAccess} currentUser={currentUser} money={money} isWorkMaterial={isWorkMaterial} wholeQuantityInput={wholeQuantityInput} hasManualPrice={hasManualPrice} compactDetails={compactDetails} hasLongDetails={hasLongDetails} />
-            </section>
-          )}
-          {activePage === "prices" && (
-            <MaterialsPage materials={mat.materials} materialsTotal={mat.materialsTotal} materialsHasMore={mat.materialsHasMore} materialsLoadingMore={mat.materialsLoadingMore} materialQuery={mat.materialQuery} setMaterialQuery={mat.setMaterialQuery} materialType={mat.materialType} setMaterialType={mat.setMaterialType} equipmentCategoryFilter={mat.equipmentCategoryFilter} setEquipmentCategoryFilter={mat.setEquipmentCategoryFilter} technologyFilter={mat.technologyFilter} setTechnologyFilter={mat.setTechnologyFilter} megapixelsFilter={mat.megapixelsFilter} setMegapixelsFilter={mat.setMegapixelsFilter} priceToFilter={mat.priceToFilter} setPriceToFilter={mat.setPriceToFilter} file={mat.file} setFile={mat.setFile} importMode={mat.importMode} setImportMode={mat.setImportMode} supplierUrl={mat.supplierUrl} setSupplierUrl={mat.setSupplierUrl} materialForm={mat.materialForm} updateMaterialForm={mat.updateMaterialForm} handleUpload={() => mat.handleUpload(refreshData)} handleCreateMaterial={() => mat.handleCreateMaterial(refreshData)} loadMoreMaterials={mat.loadMoreMaterials} loadAllMaterials={mat.loadAllMaterials} quantityByMaterial={sm.quantityByMaterial} setQuantityByMaterial={sm.setQuantityByMaterial} handleAddMaterialToSmeta={sm.handleAddMaterialToSmeta} money={money} isWorkMaterial={isWorkMaterial} wholeQuantityInput={wholeQuantityInput} />
-          )}
-          {activePage === "assistant" && (
-            <AssistantPage selectedSmeta={sm.selectedSmeta} previewSmeta={sm.previewSmeta} aiPrompt={ai.aiPrompt} setAiPrompt={ai.setAiPrompt} aiResponse={ai.aiResponse} handleAiRequest={() => ai.handleAiRequest(sm.selectedSmeta, sm.setSmetas, sm.setSelectedSmetaId)} money={money} />
-          )}
-          {activePage === "admin" && currentUser?.is_admin && (
-            <AdminPage currentUser={currentUser} adminUsers={adm.adminUsers} adminSelectedUserId={adm.adminSelectedUserId} adminUserSmetas={adm.adminUserSmetas} adminBusy={adm.adminBusy} selectedAdminUser={adm.selectedAdminUser} handleSelectAdminUser={adm.handleSelectAdminUser} handleToggleAdmin={adm.handleToggleAdmin} handleDeleteUser={adm.handleDeleteUser} aiSettings={ai.aiSettings} setAiSettings={ai.setAiSettings} apiKeyInput={ai.apiKeyInput} setApiKeyInput={ai.setApiKeyInput} models={ai.models} handleSaveAiSettings={ai.handleSaveAiSettings} handleLoadModels={ai.handleLoadModels} handleSelectModel={ai.handleSelectModel} modelPrice={ai.modelPrice} money={money} />
-          )}
+          <Routes>
+            <Route path="/" element={<Navigate to="/smetas" replace />} />
+            <Route path="/smetas" element={
+              <section className="workspace">
+                <SmetaList smetas={sm.smetas} smetaTree={smetaTree} selectedSmetaId={sm.selectedSmetaId} setSelectedSmetaId={sm.setSelectedSmetaId} expandedSmetaIds={sm.expandedSmetaIds} setExpandedSmetaIds={sm.setExpandedSmetaIds} smetaName={sm.smetaName} setSmetaName={sm.setSmetaName} handleCreateSmeta={sm.handleCreateSmeta} money={money} parentIdOf={parentIdOf} />
+                <SmetaEditor selectedSmeta={sm.selectedSmeta} previewSmeta={sm.previewSmeta} groupedItems={groupedItems} sections={mat.sections} smetaDetails={sm.smetaDetails} updateSmetaDetails={sm.updateSmetaDetails} updateSectionAdjustment={sm.updateSectionAdjustment} handleSaveSmetaDetails={sm.handleSaveSmetaDetails} shareForm={sm.shareForm} setShareForm={sm.setShareForm} handleShareSmeta={() => sm.handleShareSmeta(adm.loadAdminData)} handleBranchSmeta={sm.handleBranchSmeta} handleCheckSmeta={() => sm.handleCheckSmeta(ai.setAiResponse)} handleExportExcel={sm.handleExportExcel} handlePrintSmeta={sm.handlePrintSmeta} handleDeleteSmeta={sm.handleDeleteSmeta} itemForm={sm.itemForm} updateItemForm={sm.updateItemForm} itemSuggestions={sm.itemSuggestions} handleAddCustomItem={sm.handleAddCustomItem} handleAddSuggestedItem={sm.handleAddSuggestedItem} handleDeleteItem={sm.handleDeleteItem} updateItemDraft={sm.updateItemDraft} getItemDraft={sm.getItemDraft} commitItemDraft={sm.commitItemDraft} expandedItems={sm.expandedItems} toggleItem={sm.toggleItem} aiPrompt={ai.aiPrompt} setAiPrompt={ai.setAiPrompt} handleAiRequest={() => ai.handleAiRequest(sm.selectedSmeta, sm.setSmetas, sm.setSelectedSmetaId)} adminAccess={adm.adminAccess} adminBusy={adm.adminBusy} handleRevokeAccess={adm.handleRevokeAccess} currentUser={currentUser} money={money} isWorkMaterial={isWorkMaterial} wholeQuantityInput={wholeQuantityInput} hasManualPrice={hasManualPrice} compactDetails={compactDetails} hasLongDetails={hasLongDetails} />
+              </section>
+            } />
+            <Route path="/prices" element={
+              <MaterialsPage materials={mat.materials} materialsTotal={mat.materialsTotal} materialsHasMore={mat.materialsHasMore} materialsLoadingMore={mat.materialsLoadingMore} materialQuery={mat.materialQuery} setMaterialQuery={mat.setMaterialQuery} materialType={mat.materialType} setMaterialType={mat.setMaterialType} equipmentCategoryFilter={mat.equipmentCategoryFilter} setEquipmentCategoryFilter={mat.setEquipmentCategoryFilter} technologyFilter={mat.technologyFilter} setTechnologyFilter={mat.setTechnologyFilter} megapixelsFilter={mat.megapixelsFilter} setMegapixelsFilter={mat.setMegapixelsFilter} priceToFilter={mat.priceToFilter} setPriceToFilter={mat.setPriceToFilter} file={mat.file} setFile={mat.setFile} importMode={mat.importMode} setImportMode={mat.setImportMode} supplierUrl={mat.supplierUrl} setSupplierUrl={mat.setSupplierUrl} materialForm={mat.materialForm} updateMaterialForm={mat.updateMaterialForm} handleUpload={() => mat.handleUpload(refreshData)} handleCreateMaterial={() => mat.handleCreateMaterial(refreshData)} loadMoreMaterials={mat.loadMoreMaterials} loadAllMaterials={mat.loadAllMaterials} quantityByMaterial={sm.quantityByMaterial} setQuantityByMaterial={sm.setQuantityByMaterial} handleAddMaterialToSmeta={sm.handleAddMaterialToSmeta} money={money} isWorkMaterial={isWorkMaterial} wholeQuantityInput={wholeQuantityInput} />
+            } />
+            <Route path="/assistant" element={
+              <AssistantPage selectedSmeta={sm.selectedSmeta} previewSmeta={sm.previewSmeta} aiPrompt={ai.aiPrompt} setAiPrompt={ai.setAiPrompt} aiResponse={ai.aiResponse} handleAiRequest={() => ai.handleAiRequest(sm.selectedSmeta, sm.setSmetas, sm.setSelectedSmetaId)} money={money} />
+            } />
+            <Route path="/admin" element={
+              <PrivateRoute requireAdmin>
+                <AdminPage currentUser={currentUser} adminUsers={adm.adminUsers} adminSelectedUserId={adm.adminSelectedUserId} adminUserSmetas={adm.adminUserSmetas} adminBusy={adm.adminBusy} selectedAdminUser={adm.selectedAdminUser} handleSelectAdminUser={adm.handleSelectAdminUser} handleToggleAdmin={adm.handleToggleAdmin} handleDeleteUser={adm.handleDeleteUser} aiSettings={ai.aiSettings} setAiSettings={ai.setAiSettings} apiKeyInput={ai.apiKeyInput} setApiKeyInput={ai.setApiKeyInput} models={ai.models} handleSaveAiSettings={ai.handleSaveAiSettings} handleLoadModels={ai.handleLoadModels} handleSelectModel={ai.handleSelectModel} modelPrice={ai.modelPrice} money={money} />
+              </PrivateRoute>
+            } />
+          </Routes>
         </main>
       </div>
     </main>
@@ -118,11 +128,13 @@ function AppContent() {
 
 function App() {
   return (
-    <ThemeProvider>
-      <AuthProvider>
-        <AppContent />
-      </AuthProvider>
-    </ThemeProvider>
+    <BrowserRouter>
+      <ThemeProvider>
+        <AuthProvider>
+          <AppContent />
+        </AuthProvider>
+      </ThemeProvider>
+    </BrowserRouter>
   );
 }
 

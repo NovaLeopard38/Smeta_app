@@ -1,11 +1,13 @@
 import React from "react";
+import { Link } from "react-router-dom";
 import { useThemeContext } from "../../context/ThemeContext";
 import ShellSearch from "./ShellSearch";
+
+const pageToPath = { smetas: "/smetas", prices: "/prices", assistant: "/assistant", admin: "/admin" };
 
 function TopBar({
   currentUser,
   activePage,
-  setActivePage,
   pageItems,
   currentPageMeta,
   handleLogout,
@@ -39,14 +41,14 @@ function TopBar({
 
       <nav className="topbar-tabs" aria-label="Разделы приложения">
         {pageItems.map(page => (
-          <button
+          <Link
             key={page.id}
+            to={pageToPath[page.id] || "/smetas"}
             className={activePage === page.id ? "topbar-tab active" : "topbar-tab"}
-            onClick={() => setActivePage(page.id)}
             title={page.hint}
           >
             {page.label}
-          </button>
+          </Link>
         ))}
       </nav>
 
