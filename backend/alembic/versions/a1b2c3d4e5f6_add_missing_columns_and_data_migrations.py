@@ -9,6 +9,7 @@ from typing import Sequence, Union
 
 from alembic import op
 import sqlalchemy as sa
+from sqlalchemy.exc import OperationalError
 
 
 # revision identifiers, used by Alembic.
@@ -23,11 +24,16 @@ def upgrade() -> None:
     # Add image_url column (the only column not in the initial migration)
     try:
         op.add_column('materials', sa.Column('image_url', sa.Text(), server_default=''))
-    except Exception:
-        # Column may already exist in an existing database
+    except OperationalError:
+        # Column may already exist in databases that ran the old ensure_schema()
         pass
 
-    # Data migration: classify materials as work or equipment based on name/source
+    # Data migration: classify materials as work or equipment based on name/source.
+    # This runs unconditionally and is idempotent -- the classification is
+    # deterministic based on the name/source columns, so re-running produces the
+    # same result. The item_type column defaults to 'equipment', so there is no
+    # NULL-guard needed; the intent is to reclassify all rows using the canonical
+    # pattern-matching logic originally in ensure_schema().
     op.execute(
         "UPDATE materials SET item_type = CASE "
         "WHEN lower(coalesce(source, '')) LIKE '%работ%' "
@@ -58,5 +64,5 @@ def downgrade() -> None:
     """Remove materials.image_url column."""
     try:
         op.drop_column('materials', 'image_url')
-    except Exception:
+    except OperationalError:
         pass
