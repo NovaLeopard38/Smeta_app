@@ -16,10 +16,18 @@ from fastapi.testclient import TestClient
 
 @pytest.fixture(scope="session", autouse=True)
 def cleanup_test_db():
-    """Remove test DB before and after test session."""
+    """Remove test DB before and after test session, create tables via Alembic."""
     db_path = "./test_smeta.db"
     if os.path.exists(db_path):
         os.remove(db_path)
+
+    # Create tables using Base.metadata for tests
+    from models import Base
+    from sqlalchemy import create_engine
+    test_engine = create_engine(os.environ["DATABASE_URL"], connect_args={"check_same_thread": False})
+    Base.metadata.create_all(bind=test_engine)
+    test_engine.dispose()
+
     yield
     if os.path.exists(db_path):
         os.remove(db_path)
