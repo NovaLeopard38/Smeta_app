@@ -100,6 +100,39 @@ def item_to_dict(item, smeta=None):
     }
 
 
+def smeta_to_dict(smeta):
+    items = [item_to_dict(item, smeta) for item in smeta.items]
+    financials = smeta_financials(smeta)
+    return {
+        "id": smeta.id,
+        "parent_id": normalized_parent_id(smeta),
+        "owner_id": _normalized_owner_id(smeta),
+        "is_branch": bool(normalized_parent_id(smeta)),
+        "name": smeta.name,
+        "customer_name": smeta.customer_name or "",
+        "customer_details": smeta.customer_details or "",
+        "contractor_name": smeta.contractor_name or "",
+        "contractor_details": smeta.contractor_details or "",
+        "approver_name": smeta.approver_name or "",
+        "approver_details": smeta.approver_details or "",
+        "tax_mode": getattr(smeta, "tax_mode", "none") or "none",
+        "tax_rate": float(getattr(smeta, "tax_rate", 0) or 0),
+        "section_adjustments": parse_section_adjustments(getattr(smeta, "section_adjustments", "{}")),
+        "created_at": smeta.created_at,
+        "items": items,
+        "subtotal": financials["subtotal"],
+        "tax_amount": financials["tax_amount"],
+        "total": financials["total"],
+    }
+
+
+def _normalized_owner_id(smeta):
+    try:
+        return int(getattr(smeta, "owner_id", None) or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
 def first_matching_column(columns, variants):
     normalized = [(column, str(column).lower()) for column in columns]
     for column, lower_column in normalized:
