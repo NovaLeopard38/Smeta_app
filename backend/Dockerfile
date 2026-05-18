@@ -18,4 +18,4 @@ RUN mkdir -p logs
 
 EXPOSE 8002
 
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8002"]
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app:app --host 0.0.0.0 --port 8002"]

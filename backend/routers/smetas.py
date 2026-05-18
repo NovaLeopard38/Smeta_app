@@ -37,13 +37,13 @@ from database import get_db
 from models import SmetaAccess, User
 from schemas import ShareIn, SmetaIn, SmetaItemIn
 from utils.excel import (
-    build_smeta_print_html,
     build_smeta_workbook,
     parse_section_adjustments,
     safe_filename,
     smeta_check_issues,
     smeta_to_dict,
 )
+from utils.html_utils import build_smeta_print_html
 from utils.text_utils import (
     classify_catalog_item,
     default_section_for_type,
