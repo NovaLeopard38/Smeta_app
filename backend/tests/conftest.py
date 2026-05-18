@@ -11,42 +11,71 @@ os.environ["DATABASE_URL"] = "sqlite:///./test_smeta.db"
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from fastapi.testclient import TestClient
 
 
 @pytest.fixture(scope="session", autouse=True)
-def cleanup_test_db():
-    """Remove test DB before and after test session, create tables via Alembic."""
-    db_path = "./test_smeta.db"
-    if os.path.exists(db_path):
-        os.remove(db_path)
+def set_env():
+    """Ensure env vars are set for the entire test session."""
+    os.environ["AUTH_SECRET"] = "test-secret"
+    os.environ["ADMIN_EMAIL"] = "admin@test.com"
+    os.environ["ADMIN_PASSWORD"] = "testpass123"
+    os.environ["DATABASE_URL"] = "sqlite:///./test_smeta.db"
 
-    # Create tables using Base.metadata for tests
+
+@pytest.fixture(scope="session")
+def test_engine():
+    """Create test engine and tables once for the session."""
+    engine = create_engine("sqlite:///./test_smeta.db", connect_args={"check_same_thread": False})
     from models import Base
-    from sqlalchemy import create_engine
-    test_engine = create_engine(os.environ["DATABASE_URL"], connect_args={"check_same_thread": False})
-    Base.metadata.create_all(bind=test_engine)
-    test_engine.dispose()
-
-    yield
-    if os.path.exists(db_path):
-        os.remove(db_path)
+    Base.metadata.create_all(bind=engine)
+    yield engine
+    Base.metadata.drop_all(bind=engine)
+    engine.dispose()
+    if os.path.exists("./test_smeta.db"):
+        os.remove("./test_smeta.db")
 
 
 @pytest.fixture
-def client():
+def db_session(test_engine):
+    """Per-test session with transaction rollback for isolation."""
+    connection = test_engine.connect()
+    transaction = connection.begin()
+    TestingSessionLocal = sessionmaker(bind=connection)
+    session = TestingSessionLocal()
+    yield session
+    session.close()
+    transaction.rollback()
+    connection.close()
+
+
+@pytest.fixture
+def client(db_session):
+    """TestClient with overridden DB dependency."""
     from app import app
+    from database import get_db
+
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as c:
         yield c
+    app.dependency_overrides.clear()
 
 
 @pytest.fixture
 def auth_headers(client):
     """Register a unique user and return auth headers."""
     import uuid
-    email = f"testuser_{uuid.uuid4().hex[:8]}@test.com"
+    email = f"test_{uuid.uuid4().hex[:8]}@test.com"
     res = client.post("/auth/register", json={"email": email, "password": "testpass123"})
-    assert res.status_code == 200
+    assert res.status_code == 200, f"Registration failed: {res.text}"
     token = res.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
 
@@ -55,6 +84,6 @@ def auth_headers(client):
 def admin_headers(client):
     """Login as admin and return auth headers."""
     res = client.post("/auth/login", json={"email": "admin@test.com", "password": "testpass123"})
-    assert res.status_code == 200
+    assert res.status_code == 200, f"Admin login failed: {res.text}"
     token = res.json()["access_token"]
     return {"Authorization": f"Bearer {token}"}
