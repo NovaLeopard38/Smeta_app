@@ -1,11 +1,12 @@
 import { useState, useEffect } from "react";
 import * as api from "./api";
-import { useAuth } from "./hooks/useAuth";
 import { useSmetas } from "./hooks/useSmetas";
 import { useMaterials } from "./hooks/useMaterials";
 import { useAI } from "./hooks/useAI";
 import { useAdmin } from "./hooks/useAdmin";
 import { money, isWorkMaterial, wholeQuantityInput, parentIdOf, hasManualPrice, compactDetails, hasLongDetails, buildSmetaTree, buildGroupedItems } from "./utils";
+import { ThemeProvider } from "./context/ThemeContext";
+import { AuthProvider, useAuthContext } from "./context/AuthContext";
 import LoginForm from "./components/auth/LoginForm";
 import TopBar from "./components/layout/TopBar";
 import SmetaList from "./components/smetas/SmetaList";
@@ -14,16 +15,15 @@ import MaterialsPage from "./components/materials/MaterialsPage";
 import AssistantPage from "./components/assistant/AssistantPage";
 import AdminPage from "./components/admin/AdminPage";
 
-function App() {
+function AppContent() {
   const [activePage, setActivePage] = useState("smetas");
-  const [theme, setTheme] = useState(() => localStorage.getItem("smeta_theme") || "light");
   const [shellSearch, setShellSearch] = useState("");
   const [shellSearchSuggestions, setShellSearchSuggestions] = useState([]);
   const [shellSearchFocused, setShellSearchFocused] = useState(false);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
 
-  const auth = useAuth();
+  const auth = useAuthContext();
   const { authToken, currentUser, setCurrentUser, setAuthToken } = auth;
   const sm = useSmetas(authToken, setMessage, setError);
   const mat = useMaterials(authToken, setMessage, setError);
@@ -35,8 +35,6 @@ function App() {
     if (Array.isArray(data)) return { items: data, total: data.length, has_more: false };
     return { items: data?.items || [], total: data?.total ?? (data?.items || []).length, has_more: Boolean(data?.has_more) };
   };
-
-  useEffect(() => { document.body.classList.toggle("theme-dark", theme === "dark"); document.body.classList.toggle("theme-light", theme === "light"); localStorage.setItem("smeta_theme", theme); }, [theme]);
 
   useEffect(() => {
     if (!authToken) return;
@@ -88,13 +86,13 @@ function App() {
   const handleShellSearchKeyDown = (e) => { if (e.key !== "Enter") return; e.preventDefault(); const q = shellSearch.trim(); if (q) { mat.setMaterialQuery(q); setActivePage("prices"); setShellSearchFocused(false); } };
 
   if (!authToken) {
-    return <LoginForm loginForm={auth.loginForm} setLoginForm={auth.setLoginForm} authMode={auth.authMode} setAuthMode={auth.setAuthMode} handleLogin={() => auth.handleLogin(setError, setMessage)} handleRegister={() => auth.handleRegister(setError, setMessage)} message={message} error={error} />;
+    return <LoginForm onLogin={() => auth.handleLogin(setError, setMessage)} onRegister={() => auth.handleRegister(setError, setMessage)} message={message} error={error} />;
   }
 
   return (
     <main className="app-shell shell-layout h-layout">
       <div className="main-shell">
-        <TopBar currentUser={currentUser} activePage={activePage} setActivePage={setActivePage} pageItems={pageItems} currentPageMeta={currentPageMeta} theme={theme} setTheme={setTheme} handleLogout={handleLogout} previewSmeta={sm.previewSmeta} money={money} shellSearch={shellSearch} setShellSearch={setShellSearch} shellSearchFocused={shellSearchFocused} setShellSearchFocused={setShellSearchFocused} shellHasResults={shellHasResults} smetaSearchResults={smetaSearchResults} shellSearchSuggestions={shellSearchSuggestions} handleShellSearchKeyDown={handleShellSearchKeyDown} handleShellSmetaOpen={handleShellSmetaOpen} handleShellSuggestionOpen={handleShellSuggestionOpen} handleShellSuggestionAdd={handleShellSuggestionAdd} parentIdOf={parentIdOf} isWorkMaterial={isWorkMaterial} />
+        <TopBar currentUser={currentUser} activePage={activePage} setActivePage={setActivePage} pageItems={pageItems} currentPageMeta={currentPageMeta} handleLogout={handleLogout} previewSmeta={sm.previewSmeta} money={money} shellSearch={shellSearch} setShellSearch={setShellSearch} shellSearchFocused={shellSearchFocused} setShellSearchFocused={setShellSearchFocused} shellHasResults={shellHasResults} smetaSearchResults={smetaSearchResults} shellSearchSuggestions={shellSearchSuggestions} handleShellSearchKeyDown={handleShellSearchKeyDown} handleShellSmetaOpen={handleShellSmetaOpen} handleShellSuggestionOpen={handleShellSuggestionOpen} handleShellSuggestionAdd={handleShellSuggestionAdd} parentIdOf={parentIdOf} isWorkMaterial={isWorkMaterial} />
         <main className="content">
           {(message || error) && <div className={error ? "notice error" : "notice"}>{error || message}</div>}
           {activePage === "smetas" && (
@@ -115,6 +113,16 @@ function App() {
         </main>
       </div>
     </main>
+  );
+}
+
+function App() {
+  return (
+    <ThemeProvider>
+      <AuthProvider>
+        <AppContent />
+      </AuthProvider>
+    </ThemeProvider>
   );
 }
 

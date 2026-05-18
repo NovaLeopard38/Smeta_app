@@ -1,15 +1,9 @@
 import React from "react";
+import { useAuthContext } from "../../context/AuthContext";
 
-function LoginForm({
-  loginForm,
-  setLoginForm,
-  authMode,
-  setAuthMode,
-  handleLogin,
-  handleRegister,
-  message,
-  error,
-}) {
+function LoginForm({ onLogin, onRegister, message, error }) {
+  const { loginForm, setLoginForm, authMode, setAuthMode } = useAuthContext();
+
   return (
     <main className="login-shell">
       <section className="panel login-panel">
@@ -33,11 +27,11 @@ function LoginForm({
           onChange={e => setLoginForm(current => ({ ...current, password: e.target.value }))}
           onKeyDown={e => {
             if (e.key === "Enter") {
-              handleLogin();
+              onLogin();
             }
           }}
         />
-        <button onClick={authMode === "login" ? handleLogin : handleRegister}>
+        <button onClick={authMode === "login" ? onLogin : onRegister}>
           {authMode === "login" ? "Войти" : "Зарегистрироваться"}
         </button>
         <button className="ghost" onClick={() => setAuthMode(current => current === "login" ? "register" : "login")}>

@@ -1,4 +1,5 @@
 import React from "react";
+import { useThemeContext } from "../../context/ThemeContext";
 import ShellSearch from "./ShellSearch";
 
 function TopBar({
@@ -7,8 +8,6 @@ function TopBar({
   setActivePage,
   pageItems,
   currentPageMeta,
-  theme,
-  setTheme,
   handleLogout,
   previewSmeta,
   money,
@@ -26,6 +25,7 @@ function TopBar({
   parentIdOf,
   isWorkMaterial,
 }) {
+  const { theme, toggleTheme } = useThemeContext();
   const userAvatar = (currentUser?.email || "db").split("@")[0].slice(0, 2).toUpperCase();
 
   return (
@@ -74,7 +74,7 @@ function TopBar({
         </div>
         <button
           className="icon-btn"
-          onClick={() => setTheme(current => current === "dark" ? "light" : "dark")}
+          onClick={toggleTheme}
           title={theme === "dark" ? "Светлая тема" : "Тёмная тема"}
         >
           {theme === "dark" ? "\u2600" : "\u263E"}
