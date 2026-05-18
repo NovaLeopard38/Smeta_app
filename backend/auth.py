@@ -15,8 +15,8 @@ from models import Smeta, SmetaAccess, SmetaRevision, User
 from crud import get_smeta, create_smeta_revision
 
 AUTH_SECRET = os.getenv("AUTH_SECRET", "local-smeta-secret-change-me")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "dboy@bk.ru").lower()
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "avigYUHv1")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
 
 
 def b64url(data):
@@ -47,14 +47,14 @@ def verify_password(password, stored_hash):
 def create_token(user):
     payload = {"sub": user.id, "email": user.email, "is_admin": bool(user.is_admin), "exp": int(time.time()) + 60 * 60 * 24 * 14}
     body = b64url(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    signature = b64url(hmac.new(AUTH_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
+    signature = b64url(hmac.HMAC(AUTH_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
     return f"{body}.{signature}"
 
 
 def decode_token(token):
     try:
         body, signature = token.split(".", 1)
-        expected = b64url(hmac.new(AUTH_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
+        expected = b64url(hmac.HMAC(AUTH_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
         if not hmac.compare_digest(signature, expected):
             return None
         payload = json.loads(b64url_decode(body))
