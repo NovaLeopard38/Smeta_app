@@ -1,6 +1,12 @@
-fastapi
-uvicorn
-sqlalchemy
+fastapi[all]
+uvicorn[standard]
+sqlalchemy>=2.0
 pandas
 openpyxl
-fastapi[all]
+httpx
+python-dotenv
+alembic
+
+# Dev / test dependencies
+pytest
+pytest-asyncio
