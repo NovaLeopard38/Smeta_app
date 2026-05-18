@@ -34,8 +34,7 @@ export function useMaterials(authToken, setMessage, setError) {
       loadMaterials();
     }, 220);
     return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authToken, materialQuery, materialType, equipmentCategoryFilter, technologyFilter, megapixelsFilter, priceToFilter]);
+  }, [authToken, materialQuery, materialType, equipmentCategoryFilter, technologyFilter, megapixelsFilter, priceToFilter]); // eslint-disable-line
 
   const normalizeMaterialsResponse = (data) => {
     if (Array.isArray(data)) {

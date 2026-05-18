@@ -1,9 +1,10 @@
 import { useState, useEffect } from "react";
 import * as api from "../api";
-import { emptyItem, emptySmetaDetails, API_URL } from "../constants";
+import { emptyItem, emptySmetaDetails } from "../constants";
 import { formatError } from "./useAuth";
+import { wholeQuantityInput, wholeQuantityValue, isWorkMaterial } from "../utils";
 
-export function useSmetas(authToken, currentUser, setMessage, setError) {
+export function useSmetas(authToken, setMessage, setError) {
   const [smetas, setSmetas] = useState([]);
   const [selectedSmetaId, setSelectedSmetaId] = useState("");
   const [smetaName, setSmetaName] = useState("");
@@ -19,9 +20,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   const selectedSmeta = smetas.find(smeta => smeta.id === Number(selectedSmetaId));
 
   useEffect(() => {
-    if (!selectedSmetaId || smetas.length === 0) {
-      return;
-    }
+    if (!selectedSmetaId || smetas.length === 0) return;
     const byId = new Map(smetas.map(smeta => [smeta.id, smeta]));
     const nextExpanded = {};
     let current = byId.get(Number(selectedSmetaId));
@@ -53,49 +52,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
       setSmetaDetails(emptySmetaDetails);
     }
     setItemDrafts({});
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedSmetaId]);
-
-  useEffect(() => {
-    if (!authToken || activePage() !== "smetas") {
-      setItemSuggestions([]);
-      return undefined;
-    }
-    const query = itemForm.name.trim();
-    if (query.length < 2) {
-      setItemSuggestions([]);
-      return undefined;
-    }
-    const timer = setTimeout(async () => {
-      try {
-        const res = await api.getMaterials(authToken, {
-          q: query,
-          item_type: "all",
-          limit: 8,
-        });
-        setItemSuggestions(normalizeMaterialsResponse(res.data).items);
-      } catch (err) {
-        setItemSuggestions([]);
-      }
-    }, 180);
-    return () => clearTimeout(timer);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [authToken, itemForm.name]);
-
-  // This will be set by the parent
-  let activePage = () => "smetas";
-  const setActivePageGetter = (fn) => { activePage = fn; };
-
-  const normalizeMaterialsResponse = (data) => {
-    if (Array.isArray(data)) {
-      return { items: data, total: data.length, has_more: false };
-    }
-    return {
-      items: data?.items || [],
-      total: data?.total ?? (data?.items || []).length,
-      has_more: Boolean(data?.has_more),
-    };
-  };
+  }, [selectedSmetaId]); // eslint-disable-line
 
   const updateSelectedSmeta = (updatedSmeta) => {
     setSmetas(current => current.map(smeta => smeta.id === updatedSmeta.id ? updatedSmeta : smeta));
@@ -112,13 +69,6 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
     }
   };
 
-  const wholeQuantityInput = (value) => {
-    const digits = String(value || "").replace(/\D/g, "");
-    return digits ? String(Math.max(1, Number(digits))) : "";
-  };
-
-  const wholeQuantityValue = (value) => Math.max(1, parseInt(wholeQuantityInput(value) || "1", 10));
-
   const normalizeSmetaForSave = (details) => ({
     ...details,
     parent_id: details.parent_id || null,
@@ -132,21 +82,14 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   });
 
   const calculatePreviewSmeta = (smeta, details) => {
-    if (!smeta) {
-      return { subtotal: 0, tax_amount: 0, total: 0, items: [] };
-    }
+    if (!smeta) return { subtotal: 0, tax_amount: 0, total: 0, items: [] };
     const adjustments = details.section_adjustments || {};
     const items = (smeta.items || []).map(item => {
       const section = item.section || "Оборудование";
       const percent = Number(String(adjustments[section] ?? 0).replace(",", ".")) || 0;
       const effectiveUnitPrice = Math.round((item.unit_price || 0) * (1 + percent / 100) * 100) / 100;
       const total = Math.round((item.quantity || 0) * effectiveUnitPrice * 100) / 100;
-      return {
-        ...item,
-        effective_unit_price: effectiveUnitPrice,
-        section_adjustment_percent: percent,
-        total,
-      };
+      return { ...item, effective_unit_price: effectiveUnitPrice, section_adjustment_percent: percent, total };
     });
     const subtotal = Math.round(items.reduce((sum, item) => sum + item.total, 0) * 100) / 100;
     const taxRate = Number(details.tax_rate || 0);
@@ -161,6 +104,8 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
     return { ...smeta, ...details, items, subtotal, tax_amount: taxAmount, total };
   };
 
+  const previewSmeta = calculatePreviewSmeta(selectedSmeta, smetaDetails);
+
   const loadSmetas = async () => {
     const res = await api.getSmetas(authToken);
     setSmetas(res.data);
@@ -171,10 +116,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const handleCreateSmeta = async () => {
-    if (!smetaName.trim()) {
-      setError("Введите название сметы");
-      return;
-    }
+    if (!smetaName.trim()) { setError("Введите название сметы"); return; }
     await runAction(async () => {
       const res = await api.createSmeta(authToken, { name: smetaName });
       setSmetas(current => [res.data, ...current]);
@@ -184,10 +126,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const handleDeleteSmeta = async () => {
-    if (!selectedSmeta) {
-      setError("Смета не выбрана");
-      return;
-    }
+    if (!selectedSmeta) { setError("Смета не выбрана"); return; }
     await runAction(async () => {
       await api.deleteSmeta(authToken, selectedSmeta.id);
       const next = smetas.filter(smeta => smeta.id !== selectedSmeta.id);
@@ -197,27 +136,18 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const handleBranchSmeta = async () => {
-    if (!selectedSmeta) {
-      setError("Смета не выбрана");
-      return;
-    }
+    if (!selectedSmeta) { setError("Смета не выбрана"); return; }
     await runAction(async () => {
       const res = await api.branchSmeta(authToken, selectedSmeta.id);
       setSmetas(current => [...current, res.data]);
       setSelectedSmetaId(String(res.data.id));
-      return `Создана ветка «${res.data.name}»`;
+      return `Создана ветка \u00AB${res.data.name}\u00BB`;
     }, "Ветка сметы создана");
   };
 
   const handleSaveSmetaDetails = async () => {
-    if (!selectedSmeta) {
-      setError("Смета не выбрана");
-      return;
-    }
-    if (!smetaDetails.name.trim()) {
-      setError("Введите название сметы");
-      return;
-    }
+    if (!selectedSmeta) { setError("Смета не выбрана"); return; }
+    if (!smetaDetails.name.trim()) { setError("Введите название сметы"); return; }
     await runAction(async () => {
       const res = await api.updateSmeta(authToken, selectedSmeta.id, normalizeSmetaForSave(smetaDetails));
       updateSelectedSmeta(res.data);
@@ -225,14 +155,8 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const handleShareSmeta = async (loadAdminData) => {
-    if (!selectedSmeta) {
-      setError("Смета не выбрана");
-      return;
-    }
-    if (!shareForm.email.trim()) {
-      setError("Введите email пользователя");
-      return;
-    }
+    if (!selectedSmeta) { setError("Смета не выбрана"); return; }
+    if (!shareForm.email.trim()) { setError("Введите email пользователя"); return; }
     await runAction(async () => {
       const res = await api.shareSmeta(authToken, selectedSmeta.id, shareForm);
       setShareForm({ email: "", permission: "view" });
@@ -242,10 +166,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const handleCheckSmeta = async (setAiResponse) => {
-    if (!selectedSmeta) {
-      setError("Смета не выбрана");
-      return;
-    }
+    if (!selectedSmeta) { setError("Смета не выбрана"); return; }
     await runAction(async () => {
       const res = await api.checkSmeta(authToken, selectedSmeta.id);
       updateSelectedSmeta(res.data.smeta);
@@ -259,31 +180,20 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const handleExportExcel = () => {
-    if (!selectedSmeta) {
-      setError("Смета не выбрана");
-      return;
-    }
+    if (!selectedSmeta) { setError("Смета не выбрана"); return; }
     window.location.href = api.exportExcelUrl(selectedSmeta.id, authToken);
   };
 
   const handlePrintSmeta = () => {
-    if (!selectedSmeta) {
-      setError("Смета не выбрана");
-      return;
-    }
+    if (!selectedSmeta) { setError("Смета не выбрана"); return; }
     window.open(api.printSmetaUrl(selectedSmeta.id, authToken), "_blank", "noopener,noreferrer");
   };
-
-  const isWorkMaterial = (material) => material?.item_type === "work";
 
   const materialAddText = (material) =>
     isWorkMaterial(material) ? "Работа добавлена в смету" : "Оборудование добавлено, монтаж и пусконаладка проверены";
 
   const handleAddMaterialToSmeta = async (material) => {
-    if (!selectedSmeta) {
-      setError("Сначала создайте или выберите смету");
-      return;
-    }
+    if (!selectedSmeta) { setError("Сначала создайте или выберите смету"); return; }
     const quantity = wholeQuantityValue(quantityByMaterial[material.id]);
     await runAction(async () => {
       const res = await api.createItem(authToken, selectedSmeta.id, {
@@ -300,10 +210,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const handleAddSuggestedItem = async (material) => {
-    if (!selectedSmeta) {
-      setError("Сначала создайте или выберите смету");
-      return;
-    }
+    if (!selectedSmeta) { setError("Сначала создайте или выберите смету"); return; }
     const quantity = wholeQuantityValue(itemForm.quantity);
     await runAction(async () => {
       const res = await api.createItem(authToken, selectedSmeta.id, {
@@ -322,14 +229,8 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const handleAddCustomItem = async () => {
-    if (!selectedSmeta) {
-      setError("Сначала создайте или выберите смету");
-      return;
-    }
-    if (!itemForm.name.trim() || itemForm.unit_price === "") {
-      setError("Заполните название и цену позиции");
-      return;
-    }
+    if (!selectedSmeta) { setError("Сначала создайте или выберите смету"); return; }
+    if (!itemForm.name.trim() || itemForm.unit_price === "") { setError("Заполните название и цену позиции"); return; }
     await runAction(async () => {
       const res = await api.createItem(authToken, selectedSmeta.id, {
         ...itemForm,
@@ -351,9 +252,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   const handleUpdateItemNumber = async (item, field, value) => {
     const normalizedValue = String(value ?? "").replace(",", ".").trim();
     const numberValue = field === "quantity" ? wholeQuantityValue(normalizedValue) : Number(normalizedValue);
-    if (!selectedSmeta || Number.isNaN(numberValue) || numberValue < 0) {
-      return;
-    }
+    if (!selectedSmeta || Number.isNaN(numberValue) || numberValue < 0) return;
     const payload = {
       item_type: item.item_type || "manual",
       section: item.section || "Прочее",
@@ -372,10 +271,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   };
 
   const updateItemDraft = (item, field, value) => {
-    setItemDrafts(current => ({
-      ...current,
-      [`${item.id}:${field}`]: value,
-    }));
+    setItemDrafts(current => ({ ...current, [`${item.id}:${field}`]: value }));
   };
 
   const getItemDraft = (item, field, fallback) => {
@@ -386,9 +282,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
   const clearItemDraft = (item, field) => {
     const key = `${item.id}:${field}`;
     setItemDrafts(current => {
-      if (!Object.prototype.hasOwnProperty.call(current, key)) {
-        return current;
-      }
+      if (!Object.prototype.hasOwnProperty.call(current, key)) return current;
       const next = { ...current };
       delete next[key];
       return next;
@@ -397,14 +291,9 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
 
   const commitItemDraft = async (item, field) => {
     const key = `${item.id}:${field}`;
-    if (!Object.prototype.hasOwnProperty.call(itemDrafts, key)) {
-      return;
-    }
+    if (!Object.prototype.hasOwnProperty.call(itemDrafts, key)) return;
     const value = itemDrafts[key];
-    if (value === "") {
-      clearItemDraft(item, field);
-      return;
-    }
+    if (value === "") { clearItemDraft(item, field); return; }
     await handleUpdateItemNumber(item, field, value);
     clearItemDraft(item, field);
   };
@@ -417,10 +306,7 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
     const normalized = String(value || "").replace(",", ".");
     setSmetaDetails(current => ({
       ...current,
-      section_adjustments: {
-        ...(current.section_adjustments || {}),
-        [section]: normalized,
-      },
+      section_adjustments: { ...(current.section_adjustments || {}), [section]: normalized },
     }));
   };
 
@@ -432,60 +318,16 @@ export function useSmetas(authToken, currentUser, setMessage, setError) {
     setExpandedItems(current => ({ ...current, [itemId]: !current[itemId] }));
   };
 
-  const previewSmeta = calculatePreviewSmeta(selectedSmeta, smetaDetails);
-
   return {
-    smetas,
-    setSmetas,
-    selectedSmetaId,
-    setSelectedSmetaId,
-    selectedSmeta,
-    smetaName,
-    setSmetaName,
-    smetaDetails,
-    setSmetaDetails,
-    shareForm,
-    setShareForm,
-    expandedSmetaIds,
-    setExpandedSmetaIds,
-    itemForm,
-    setItemForm,
-    itemDrafts,
-    itemSuggestions,
-    setItemSuggestions,
-    expandedItems,
-    quantityByMaterial,
-    setQuantityByMaterial,
-    previewSmeta,
-    loadSmetas,
-    handleCreateSmeta,
-    handleDeleteSmeta,
-    handleBranchSmeta,
-    handleSaveSmetaDetails,
-    handleShareSmeta,
-    handleCheckSmeta,
-    handleExportExcel,
-    handlePrintSmeta,
-    handleAddMaterialToSmeta,
-    handleAddSuggestedItem,
-    handleAddCustomItem,
-    handleDeleteItem,
-    handleUpdateItemNumber,
-    updateItemDraft,
-    getItemDraft,
-    clearItemDraft,
-    commitItemDraft,
-    updateSmetaDetails,
-    updateSectionAdjustment,
-    updateItemForm,
-    toggleItem,
-    wholeQuantityInput,
-    wholeQuantityValue,
-    isWorkMaterial,
-    materialAddText,
-    normalizeMaterialsResponse,
-    calculatePreviewSmeta,
-    updateSelectedSmeta,
-    setActivePageGetter,
+    smetas, setSmetas, selectedSmetaId, setSelectedSmetaId, selectedSmeta,
+    smetaName, setSmetaName, smetaDetails, shareForm, setShareForm,
+    expandedSmetaIds, setExpandedSmetaIds, itemForm, itemSuggestions, setItemSuggestions,
+    expandedItems, quantityByMaterial, setQuantityByMaterial, previewSmeta,
+    loadSmetas, handleCreateSmeta, handleDeleteSmeta, handleBranchSmeta,
+    handleSaveSmetaDetails, handleShareSmeta, handleCheckSmeta,
+    handleExportExcel, handlePrintSmeta, handleAddMaterialToSmeta,
+    handleAddSuggestedItem, handleAddCustomItem, handleDeleteItem,
+    updateItemDraft, getItemDraft, commitItemDraft,
+    updateSmetaDetails, updateSectionAdjustment, updateItemForm, toggleItem,
   };
 }
