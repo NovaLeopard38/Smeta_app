@@ -13,6 +13,9 @@ from io import BytesIO
 from pathlib import Path
 from urllib.parse import quote
 
+from dotenv import load_dotenv
+load_dotenv()
+
 import httpx
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -118,9 +121,26 @@ def log_ai_command(stage, user, prompt, payload=None, reply=None, results=None, 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./smeta.db")
 SETTINGS_PATH = Path(__file__).with_name("settings.json")
 AI_AUDIT_LOG_PATH = Path(__file__).with_name("logs") / "assistant_audit.jsonl"
-AUTH_SECRET = os.getenv("AUTH_SECRET", "local-smeta-secret-change-me")
-ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "dboy@bk.ru").lower()
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "avigYUHv1")
+AUTH_SECRET = os.getenv("AUTH_SECRET", "")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").lower()
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "")
+
+if not AUTH_SECRET:
+    import warnings
+    warnings.warn(
+        "AUTH_SECRET is not set! Using insecure default. "
+        "Set AUTH_SECRET environment variable in production.",
+        stacklevel=1,
+    )
+    AUTH_SECRET = "local-smeta-secret-change-me-in-production"
+
+if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+    import warnings
+    warnings.warn(
+        "ADMIN_EMAIL and/or ADMIN_PASSWORD not set. "
+        "Set these environment variables to create the admin account.",
+        stacklevel=1,
+    )
 DEFAULT_SECTIONS = [
     "Оборудование",
     "Монтажные работы",
@@ -305,14 +325,14 @@ def verify_password(password, stored_hash):
 def create_token(user):
     payload = {"sub": user.id, "email": user.email, "is_admin": bool(user.is_admin), "exp": int(time.time()) + 60 * 60 * 24 * 14}
     body = b64url(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-    signature = b64url(hmac.new(AUTH_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
+    signature = b64url(hmac.HMAC(AUTH_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
     return f"{body}.{signature}"
 
 
 def decode_token(token):
     try:
         body, signature = token.split(".", 1)
-        expected = b64url(hmac.new(AUTH_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
+        expected = b64url(hmac.HMAC(AUTH_SECRET.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest())
         if not hmac.compare_digest(signature, expected):
             return None
         payload = json.loads(b64url_decode(body))
@@ -324,6 +344,8 @@ def decode_token(token):
 
 
 def ensure_admin_user():
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        return
     db = SessionLocal()
     try:
         admin = db.query(User).filter(User.email == ADMIN_EMAIL).first()
@@ -3030,7 +3052,7 @@ def _tk_jwt(scope: str) -> str:
         secret_bytes = base64.urlsafe_b64decode(secret + "=" * (-len(secret) % 4))
     except Exception:
         secret_bytes = secret.encode()
-    sig = hmac.new(secret_bytes, f"{h}.{p}".encode(), hashlib.sha256).digest()
+    sig = hmac.HMAC(secret_bytes, f"{h}.{p}".encode(), hashlib.sha256).digest()
     sig_b64 = base64.urlsafe_b64encode(sig).rstrip(b"=").decode()
     return f"{h}.{p}.{sig_b64}"
 

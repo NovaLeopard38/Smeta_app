@@ -5,22 +5,28 @@ __pycache__/
 .venv/
 venv/
 
-# Local DB and backups
-backend/smeta.db
-backend/smeta.db-journal
-backend/*.bak
-backend/*.bak.*
+# Database files (anywhere in the repo)
+*.db
+*.db-journal
+
+# Backups
+*.bak
 *.bak.*
 
-# Secrets
+# Secrets / local config
 backend/settings.json
 backend/.env
 .env
 
-# Docker leftovers
-backend/Dockerfile
+# Node
+node_modules/
+frontend/build/
+
+# Docker (local Dockerfiles may be overridden)
+# Keep Dockerfiles in repo for reproducibility
 
 # Logs / tmp
+logs/
 *.log
 *.tmp
 *.swp
