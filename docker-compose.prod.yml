@@ -1,0 +1,78 @@
+version: "3.8"
+
+# Production stack for v-s-b.ru
+# Traefik handles SSL (Let's Encrypt) + redirects HTTP → HTTPS
+# Frontend nginx handles internal routing (/api/ → backend)
+#
+# Required env vars (set in Portainer stack env or backend/.env):
+#   ACME_EMAIL      — email for Let's Encrypt notifications
+#   AUTH_SECRET     — JWT signing secret (32+ random chars)
+#   ADMIN_EMAIL     — initial admin account email
+#   ADMIN_PASSWORD  — initial admin account password
+#   CORS_ORIGINS    — allowed origins, e.g. https://v-s-b.ru
+
+services:
+  traefik:
+    image: traefik:v3.0
+    container_name: traefik
+    restart: unless-stopped
+    command:
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entryPoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entryPoint.scheme=https"
+      - "--entrypoints.websecure.address=:443"
+      - "--certificatesresolvers.le.acme.httpchallenge=true"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--certificatesresolvers.le.acme.email=${ACME_EMAIL}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--log.level=INFO"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+      - "letsencrypt_data:/letsencrypt"
+
+  backend:
+    build:
+      context: ./backend
+    container_name: smeta-backend
+    restart: unless-stopped
+    volumes:
+      - db_data:/app/data
+      - ./backend/logs:/app/logs
+    environment:
+      - DATABASE_URL=sqlite:///./data/smeta.db
+      - AUTH_SECRET=${AUTH_SECRET}
+      - ADMIN_EMAIL=${ADMIN_EMAIL}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD}
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://v-s-b.ru}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        REACT_APP_API_URL: /api
+    container_name: smeta-frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`v-s-b.ru`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls.certresolver=le"
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+
+volumes:
+  db_data:
+  letsencrypt_data:
