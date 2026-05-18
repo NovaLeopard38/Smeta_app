@@ -17,6 +17,7 @@ class Material(Base):
     unit = Column(String)
     price = Column(Float, nullable=False)
     source = Column(String)
+    image_url = Column(Text, default='')
     last_update = Column(DateTime, default=datetime.datetime.utcnow)
 
 
