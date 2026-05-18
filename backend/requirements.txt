@@ -5,3 +5,8 @@ pandas
 openpyxl
 httpx
 python-dotenv
+alembic
+
+# Dev / test dependencies
+pytest
+pytest-asyncio
