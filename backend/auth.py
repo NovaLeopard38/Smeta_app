@@ -125,6 +125,10 @@ def require_smeta_access(db, smeta_id, user, write=False):
 
 
 def ensure_admin_user():
+    if not ADMIN_EMAIL or not ADMIN_PASSWORD:
+        import warnings
+        warnings.warn("ADMIN_EMAIL/ADMIN_PASSWORD not set -- skipping admin user creation.")
+        return
     db = SessionLocal()
     try:
         admin = db.query(User).filter(User.email == ADMIN_EMAIL).first()
