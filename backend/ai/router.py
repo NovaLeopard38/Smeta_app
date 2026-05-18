@@ -46,10 +46,9 @@ from crud import (
 )
 from database import engine, get_db
 from models import User
-from routers.leads import normalize_phone, _next_client_code
 from schemas import AiCommandIn, AiSettingsIn, PublicChatIn
 from utils.excel import smeta_to_dict
-from utils.text_utils import compact_text, endpoint, http_error_detail, normalize_model
+from utils.text_utils import compact_text, endpoint, http_error_detail, normalize_model, normalize_phone, next_client_code
 
 router = APIRouter()
 
@@ -415,7 +414,7 @@ def public_ai_chat(body: PublicChatIn):
     with engine.begin() as conn:
         row = conn.exec_driver_sql("SELECT id, client_code FROM leads WHERE phone = ?", (phone,)).fetchone()
         if not row:
-            code = _next_client_code(conn)
+            code = next_client_code(conn)
             conn.exec_driver_sql(
                 "INSERT INTO leads (phone, client_code, source_first) VALUES (?, ?, ?)",
                 (phone, code, "ai-chat"),

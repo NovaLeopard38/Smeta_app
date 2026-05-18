@@ -71,7 +71,7 @@ def material_matches_category(material, category):
 
 def _extract_significant_tokens(query: str):
     """Split a product name into significant tokens for catalog search."""
-    return [t for t in _re_img.findall(r"[\w\-./]+", query, _re_img.UNICODE) if not t.isdigit()][:4]
+    return [t for t in re.findall(r"[\w\-./]+", query, re.UNICODE) if not t.isdigit()][:4]
 
 
 def _fetch_optimus_image(query: str) -> str:
@@ -82,7 +82,7 @@ def _fetch_optimus_image(query: str) -> str:
     # Optimus catalog search is sensitive to short codes — try multiple queries
     queries = []
     # Find model code like "RA-241E" or "P098"
-    codes = _re_img.findall(r"[A-Z]+[-]?\d+[A-Z0-9]*", query)
+    codes = re.findall(r"[A-Z]+[-]?\d+[A-Z0-9]*", query)
     if codes:
         queries.append(codes[0])
     queries.append(" ".join(tokens[:3]) or query[:60])
@@ -106,10 +106,10 @@ def _fetch_optimus_image(query: str) -> str:
         except Exception:
             continue
         # Product cards on optimus-cctv.ru use /images/prev/{hash}_s500x500.jpg
-        m = _re_img.search(r'<img[^>]+(?:src|data-src)="(/images/prev/[^"]+_s500x500\.(?:jpg|jpeg|png|webp))"', html, _re_img.IGNORECASE)
+        m = re.search(r'<img[^>]+(?:src|data-src)="(/images/prev/[^"]+_s500x500\.(?:jpg|jpeg|png|webp))"', html, re.IGNORECASE)
         if not m:
             # Fall back to any product image
-            m = _re_img.search(r'<img[^>]+(?:src|data-src)="(/images/prev/[^"]+\.(?:jpg|jpeg|png|webp))"', html, _re_img.IGNORECASE)
+            m = re.search(r'<img[^>]+(?:src|data-src)="(/images/prev/[^"]+\.(?:jpg|jpeg|png|webp))"', html, re.IGNORECASE)
         if m:
             return "https://optimus-cctv.ru" + m.group(1)
     return ""
@@ -144,7 +144,7 @@ def _fetch_tinko_image(query: str) -> str:
         r'<img[^>]+src="(https?://[^"]+/upload/[^"]+\.(?:jpg|jpeg|png|webp))"',
     ]
     for pat in patterns:
-        m = _re_img.search(pat, html, _re_img.IGNORECASE)
+        m = re.search(pat, html, re.IGNORECASE)
         if m:
             src_url = m.group(1)
             if src_url.startswith("/"):

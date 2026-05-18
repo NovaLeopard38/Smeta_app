@@ -27,6 +27,15 @@ def _ensure_seo_schema():
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Ensure site_settings table exists before inserting into it,
+        # in case this module loads before routers/site.py
+        conn.exec_driver_sql("""
+            CREATE TABLE IF NOT EXISTS site_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT '',
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
         seeds = [
             ("home",    "Главная",    "ВСБ39 \u2014 Видеонаблюдение, СКУД, Охранная сигнализация в Калининграде",
              "Установка и обслуживание систем безопасности в Калининграде: видеонаблюдение, СКУД, ОС/ОТС. 313 объектов, выезд 4 часа, гарантия 6 мес.",

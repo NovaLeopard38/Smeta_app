@@ -4,6 +4,7 @@ from fastapi import APIRouter, HTTPException, Query
 
 from database import engine
 from schemas import LeadIn, QuoteIn
+from utils.text_utils import normalize_phone, next_client_code
 
 router = APIRouter()
 
@@ -47,24 +48,9 @@ def _ensure_leads_schema():
 _ensure_leads_schema()
 
 
-def normalize_phone(raw: str) -> str:
-    """Normalize Russian phone to +7XXXXXXXXXX. Returns '' if invalid."""
-    if not raw:
-        return ''
-    digits = ''.join(ch for ch in str(raw) if ch.isdigit())
-    if len(digits) == 11 and digits[0] in ('7', '8'):
-        digits = '7' + digits[1:]
-    elif len(digits) == 10:
-        digits = '7' + digits
-    else:
-        return ''
-    return '+' + digits
-
-
 def _next_client_code(conn) -> str:
-    """K-NNNNNN sequential by max(id)+1."""
-    row = conn.exec_driver_sql("SELECT IFNULL(MAX(id), 0) FROM leads").fetchone()
-    return f"K-{(row[0] or 0) + 1:06d}"
+    """K-NNNNNN sequential by max(id)+1. Delegates to utils.text_utils.next_client_code."""
+    return next_client_code(conn)
 
 
 def _next_quote_no(conn, lead_id: int, kind: str) -> str:

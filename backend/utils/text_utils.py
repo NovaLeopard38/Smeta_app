@@ -262,3 +262,23 @@ def http_error_detail(exc, fallback):
     except (ValueError, AttributeError):
         detail = response.text
     return f"{fallback}: HTTP {response.status_code}. {str(detail)[:600]}"
+
+
+def normalize_phone(raw: str) -> str:
+    """Normalize Russian phone to +7XXXXXXXXXX. Returns '' if invalid."""
+    if not raw:
+        return ''
+    digits = ''.join(ch for ch in str(raw) if ch.isdigit())
+    if len(digits) == 11 and digits[0] in ('7', '8'):
+        digits = '7' + digits[1:]
+    elif len(digits) == 10:
+        digits = '7' + digits
+    else:
+        return ''
+    return '+' + digits
+
+
+def next_client_code(conn) -> str:
+    """K-NNNNNN sequential by max(id)+1."""
+    row = conn.exec_driver_sql("SELECT IFNULL(MAX(id), 0) FROM leads").fetchone()
+    return f"K-{(row[0] or 0) + 1:06d}"
